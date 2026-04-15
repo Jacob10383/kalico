@@ -6,6 +6,11 @@
 import logging, math
 
 from .motor_fault_decoder import format_fault_summary as _format_motor_fault_summary
+
+
+class HomingZProbeNotCalibrated(Exception):
+    """Z rise completed but probe model not loaded — motors remain enabled."""
+    pass
 HOMING_START_DELAY = 0.001
 ENDSTOP_SAMPLE_TIME = .000015
 ENDSTOP_SAMPLE_COUNT = 4
@@ -30,6 +35,23 @@ def multi_complete(printer, completions):
         reactor.register_callback(
             lambda e, c=c: cp.complete(1) if c.wait() else 0)
     return cp
+
+# Virtual endstop that never triggers — for HomingMove without physical endstop backing
+class _NullEndstop:
+    def __init__(self, steppers, reactor):
+        self._steppers = steppers
+        self._reactor = reactor
+    def get_steppers(self):
+        return list(self._steppers)
+    def home_start(self, print_time, sample_time, sample_count,
+                   rest_time, triggered=True):
+        # Returns a completion that never fires so drip_move runs to end naturally
+        return self._reactor.completion()
+    def home_wait(self, home_end_time):
+        return 0.0  # not triggered; clean with check_triggered=False
+    def query_endstop(self, print_time):
+        return False
+
 
 # Tracking of stepper positions during a homing/probing move
 class StepperPosition:
@@ -496,6 +518,18 @@ class PrinterHoming:
         return self._session_aborted
     def is_homing_abort_in_progress(self):
         return self._abort_in_progress
+    def _is_probe_model_ready(self):
+        scanner = self.printer.lookup_object('cartographer', None)
+        if scanner is None:
+            return True
+        scan_mode = getattr(scanner, 'scan_mode', None)
+        if scan_mode is None:
+            return True
+        if hasattr(scan_mode, 'is_ready'):
+            return bool(scan_mode.is_ready)
+        if hasattr(scan_mode, 'has_model'):
+            return bool(scan_mode.has_model())
+        return True
     def _check_scanner_connected(self):
         scanner = self.printer.lookup_object('cartographer', None)
         if scanner is not None:
@@ -910,12 +944,17 @@ class PrinterHoming:
             z_align.wait_prepare_complete()
         self._move_to_z_home_center(speed=200.0)
         if use_z_align:
+            if not self._is_probe_model_ready():
+                z_align.perform_unmonitored_rise()
+                raise HomingZProbeNotCalibrated("Scan model not loaded")
             z_align.perform_blocking_rise()
             if self._session_aborted:
                 raise self.printer.command_error(
                     self.motor_fault_abort_reason or 'Homing session aborted')
         elif z_was_homed:
             self._move_known_z_to_clearance_before_home(kin)
+        if not self._is_probe_model_ready():
+            raise HomingZProbeNotCalibrated("Scan model not loaded")
         self._check_scanner_connected()
         homing_state.set_axes([2])
         kin.home(homing_state)
@@ -961,6 +1000,21 @@ class PrinterHoming:
                         homing_state, kin, z_was_homed=('z' in homed_axes))
             if session_owned:
                 self._finish_managed_homing_session()
+        except HomingZProbeNotCalibrated as err:
+            # Rise completed cleanly — just restore state without killing motors
+            logging.warning('homing: probe not calibrated after rise: %s', err)
+            try:
+                self._set_homing_stall_mode(2)
+            except Exception:
+                logging.exception(
+                    'homing: failed restoring stall mode after probe-not-calibrated')
+            try:
+                self._mark_motor_control_not_homing()
+            except Exception:
+                logging.exception(
+                    'homing: failed marking not-homing after probe-not-calibrated')
+            self.end_homing_session()
+            raise self.printer.command_error(str(err))
         except self.printer.command_error as err:
             logging.exception(err)
             abort_reason = self.motor_fault_abort_reason
