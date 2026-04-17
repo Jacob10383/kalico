@@ -5,6 +5,8 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging
 import os
+import shlex
+import shutil
 
 import cffi
 
@@ -308,6 +310,10 @@ def check_build_code(sources, target):
     return not obj_times or max(src_times) > min(obj_times)
 
 
+def check_gcc_available():
+    return shutil.which(shlex.split(GCC_CMD)[0]) is not None
+
+
 # Check if the current gcc version supports a particular command-line option
 def check_gcc_option(option):
     cmd = "%s %s -S -o /dev/null -xc /dev/null > /dev/null 2>&1" % (
@@ -346,14 +352,29 @@ def get_ffi():
         ofiles = get_abs_files(srcdir, OTHER_FILES)
         destlib = get_abs_files(srcdir, [DEST_LIB])[0]
         if check_build_code(srcfiles + ofiles + [__file__], destlib):
-            if check_gcc_option(SSE_FLAGS):
-                cmd = "%s %s %s" % (GCC_CMD, SSE_FLAGS, COMPILE_ARGS)
-            elif check_gcc_option(NEON_FLAGS):
-                cmd = "%s %s %s" % (GCC_CMD, NEON_FLAGS, COMPILE_ARGS)
+            if not check_gcc_available():
+                if not os.path.exists(destlib):
+                    msg = (
+                        "Unable to build C code module (%s not available and"
+                        " no existing %s found)"
+                    ) % (GCC_CMD, DEST_LIB)
+                    logging.error(msg)
+                    raise Exception(msg)
+                logging.warning(
+                    "Reusing existing C code module %s because %s is not"
+                    " available",
+                    DEST_LIB,
+                    GCC_CMD,
+                )
             else:
-                cmd = "%s %s" % (GCC_CMD, COMPILE_ARGS)
-            logging.info("Building C code module %s", DEST_LIB)
-            do_build_code(cmd % (destlib, " ".join(srcfiles)))
+                if check_gcc_option(SSE_FLAGS):
+                    cmd = "%s %s %s" % (GCC_CMD, SSE_FLAGS, COMPILE_ARGS)
+                elif check_gcc_option(NEON_FLAGS):
+                    cmd = "%s %s %s" % (GCC_CMD, NEON_FLAGS, COMPILE_ARGS)
+                else:
+                    cmd = "%s %s" % (GCC_CMD, COMPILE_ARGS)
+                logging.info("Building C code module %s", DEST_LIB)
+                do_build_code(cmd % (destlib, " ".join(srcfiles)))
         FFI_main = cffi.FFI()
         for d in defs_all:
             FFI_main.cdef(d)
