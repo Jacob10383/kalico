@@ -1,6 +1,7 @@
 # development
 out
 *.so
+!klippy/chelper/c_helper.so
 *.pyc
 __pycache__/
 .config
