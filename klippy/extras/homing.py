@@ -5,7 +5,10 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging, math
 
-from .motor_fault_decoder import format_fault_summary as _format_motor_fault_summary
+try:
+    from .motor_fault_decoder import format_fault_summary as _format_motor_fault_summary
+except ImportError:
+    from .motor_control import format_fault_summary as _format_motor_fault_summary
 
 
 class HomingZProbeNotCalibrated(Exception):
