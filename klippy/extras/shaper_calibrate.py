@@ -650,8 +650,11 @@ class ShaperCalibrate:
             self.save_params(configfile, "y", shaper_name, shaper_freq)
         else:
             configfile.set("input_shaper", "shaper_type_" + axis, shaper_name)
+            name = "shaper_freq_"
+            if shaper_name.startswith("smooth_"):
+                name = "smoother_freq_"
             configfile.set(
-                "input_shaper", "shaper_freq_" + axis, "%.1f" % (shaper_freq,)
+                "input_shaper", name + axis, "%.1f" % (shaper_freq,)
             )
 
     def apply_params(self, input_shaper, axis, shaper_name, shaper_freq):
@@ -661,13 +664,16 @@ class ShaperCalibrate:
             return
         gcode = self.printer.lookup_object("gcode")
         axis = axis.upper()
+        name = "SHAPER_FREQ_"
+        if shaper_name.startswith("smooth_"):
+            name = "SMOOTHER_FREQ_"
         input_shaper.cmd_SET_INPUT_SHAPER(
             gcode.create_gcode_command(
                 "SET_INPUT_SHAPER",
                 "SET_INPUT_SHAPER",
                 {
                     "SHAPER_TYPE_" + axis: shaper_name,
-                    "SHAPER_FREQ_" + axis: shaper_freq,
+                    name + axis: shaper_freq,
                 },
             )
         )
