@@ -8,6 +8,8 @@ import copy
 import json
 import logging
 import math
+import os
+import sys
 import threading
 import traceback
 import typing
@@ -15,6 +17,108 @@ import typing
 import jinja2
 
 from klippy import configfile
+
+######################################################################
+# Jinja2 bytecode cache
+######################################################################
+
+
+class _KlipperBytecodeCache(jinja2.BytecodeCache):
+    def __init__(self, directory):
+        self.directory = directory
+        self._hits = 0
+        self._misses = 0
+        self._stale = 0
+        self._writes = 0
+        self._errors = 0
+
+    def _cache_path(self, bucket):
+        return os.path.join(self.directory, bucket.key + ".cache")
+
+    def load_bytecode(self, bucket):
+        try:
+            with open(self._cache_path(bucket), "rb") as f:
+                bucket.load_bytecode(f)
+            if bucket.code is not None:
+                self._hits += 1
+            else:
+                self._stale += 1
+        except FileNotFoundError:
+            self._misses += 1
+        except Exception:
+            self._errors += 1
+            bucket.reset()
+
+    def dump_bytecode(self, bucket):
+        path = self._cache_path(bucket)
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "wb") as f:
+                bucket.write_bytecode(f)
+            os.replace(tmp, path)
+            self._writes += 1
+        except Exception:
+            self._errors += 1
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    def log_stats(self):
+        logging.info(
+            "[JINJA_CACHE] summary: %d hit, %d miss, %d stale,"
+            " %d written, %d error  (%d total)",
+            self._hits,
+            self._misses,
+            self._stale,
+            self._writes,
+            self._errors,
+            self._hits + self._misses + self._stale,
+        )
+
+
+class _KlipperTemplateLoader(jinja2.BaseLoader):
+    """In-memory loader that lets Jinja manage cache invalidation."""
+
+    def __init__(self):
+        self._sources = {}
+        self._lock = threading.RLock()
+
+    def set_source(self, name, source):
+        with self._lock:
+            self._sources[name] = source
+
+    def get_source(self, environment, template):
+        with self._lock:
+            source = self._sources.get(template)
+        if source is None:
+            raise jinja2.TemplateNotFound(template)
+        return source, None, lambda: self._sources.get(template) == source
+
+
+def _create_jinja_cache():
+    try:
+        py_ver = "%d%d" % (sys.version_info.major, sys.version_info.minor)
+        jinja_ver = jinja2.__version__.replace(".", "_")
+        cache_dir = os.path.expanduser(
+            "~/.cache/klippy/jinja2_py%s_j%s" % (py_ver, jinja_ver)
+        )
+        os.makedirs(cache_dir, exist_ok=True)
+        return _KlipperBytecodeCache(cache_dir)
+    except Exception:
+        return None
+
+
+def _load_jinja_template(env, name, script):
+    env.loader.set_source(name, script)
+    try:
+        return env.get_template(name)
+    except jinja2.exceptions.TemplateSyntaxError:
+        raise
+    except Exception:
+        pass
+    return env.from_string(script)
+
 
 ######################################################################
 # Template handling
@@ -98,7 +202,7 @@ class TemplateWrapperJinja:
         gcode_macro = self.printer.lookup_object("gcode_macro")
         self.create_template_context = gcode_macro.create_template_context
         try:
-            self.template = env.from_string(script)
+            self.template = _load_jinja_template(env, name, script)
         except jinja2.exceptions.TemplateSyntaxError as e:
             lines = script.splitlines()
             msg = "Error loading template '%s'\nline %s: %s # %s" % (
@@ -314,6 +418,8 @@ class Template:
 class PrinterGCodeMacro:
     def __init__(self, config):
         self.printer = config.get_printer()
+        self._bytecode_cache = _create_jinja_cache()
+        self._template_loader = _KlipperTemplateLoader()
         self.env = jinja2.Environment(
             "{%",
             "%}",
@@ -323,12 +429,21 @@ class PrinterGCodeMacro:
                 "jinja2.ext.do",
                 "jinja2.ext.loopcontrols",
             ],
+            loader=self._template_loader,
+            bytecode_cache=self._bytecode_cache,
         )
+        if self._bytecode_cache is not None:
+            self.printer.register_event_handler(
+                "klippy:connect", self._log_cache_stats
+            )
 
         self.gcode = self.printer.lookup_object("gcode")
         self.gcode.register_command(
             "RELOAD_GCODE_MACROS", self.cmd_RELOAD_GCODE_MACROS
         )
+
+    def _log_cache_stats(self):
+        self._bytecode_cache.log_stats()
 
     def load_template(self, config, option, default=None):
         name = "%s:%s" % (config.get_name(), option)

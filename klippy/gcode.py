@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import shlex
+import time
 
 from . import mathutil
 
@@ -163,6 +164,7 @@ class GCodeDispatch:
         self.status_commands = {}
         self._interrupt_counter = 0
         self._script_context = 0
+        self._init_monotime = time.monotonic()
         # Register commands needed before config file is loaded
         handlers = [
             "M110",
@@ -286,7 +288,10 @@ class GCodeDispatch:
         self.is_printer_ready = True
         self.gcode_handlers = self.ready_gcode_handlers
         self._build_status_commands()
-        self._respond_state("Ready")
+        elapsed = time.monotonic() - self._init_monotime
+        self.respond_info(
+            "Klipper state: Ready in %.1f seconds" % (elapsed,), log=False
+        )
 
     # Parse input into commands
     args_r = re.compile("([A-Z_]+|[A-Z*])")
