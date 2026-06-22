@@ -226,11 +226,25 @@ class ResonanceTestExecutor:
         self.printer = config.get_printer()
         self.gcode = self.printer.lookup_object("gcode")
 
-    def run_test(self, test_seq, axis, freq_end, accel_per_hz, gcmd):
+    def run_test(self, test_seq, axis, gcmd):
+        # Compute the actual max accel and max velocity by integrating the
+        # test sequence.  This correctly accounts for SWEEPING_ACCEL and the
+        # ACCEL_PER_HZ override on the command line, both of which the old
+        # fixed formula (accel_per_hz * 0.25 + 1.0) silently ignored.
+        max_accel = 0.0
+        max_v = 0.0
+        v = 0.0
+        last_t = 0.0
+        for next_t, accel, _freq in test_seq:
+            t_seg = next_t - last_t
+            v += accel * t_seg
+            max_accel = max(max_accel, abs(accel))
+            max_v = max(max_v, abs(v))
+            last_t = next_t
         with suspend_limits(
             self.printer,
-            freq_end * accel_per_hz + 10.0,
-            accel_per_hz * 0.25 + 1.0,
+            max_accel + 10.0,
+            max_v + 1.0,
             gcmd.get_int("INPUT_SHAPING", 0),
         ):
             self._run_test(test_seq, axis, gcmd)
@@ -403,13 +417,7 @@ class ResonanceTester:
 
                 # Generate moves
                 test_seq = self.generator.gen_test()
-                self.executor.run_test(
-                    test_seq,
-                    axis,
-                    self.generator.vibration_generator.freq_end,
-                    self.generator.vibration_generator.accel_per_hz,
-                    gcmd,
-                )
+                self.executor.run_test(test_seq, axis, gcmd)
                 for chip_axis, aclient, chip_name in raw_values:
                     aclient.finish_measurements()
                     if raw_name_suffix is not None:
