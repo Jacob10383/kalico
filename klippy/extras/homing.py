@@ -89,6 +89,7 @@ class HomingMove:
         self.force_stop_reason = None
         self.trigger_times = {}
         self.triggered_endstops = ()
+        self.drip_completion = None
 
     def get_trigger_mm_for_stepper_names(self, stepper_names):
         trigger_positions = []
@@ -135,9 +136,7 @@ class HomingMove:
         return list(kin.calc_position(kin_spos))[:3] + thpos[3:]
 
     def _complete_drip_move(self):
-        if getattr(self.toolhead, "special_queuing_state", "") != "Drip":
-            return
-        drip_completion = getattr(self.toolhead, "drip_completion", None)
+        drip_completion = self.drip_completion
         if drip_completion is None:
             return
         try:
@@ -147,25 +146,13 @@ class HomingMove:
                 "failed completing drip homing stop",
                 level=logging.exception)
 
-    def handle_force_stop(self, pause=1.0, complete_drip=False):
-        if complete_drip:
-            self._complete_drip_move()
-        self.toolhead._handle_shutdown()
-        if pause and self.toolhead.can_pause:
-            self.toolhead.reactor.pause(
-                self.toolhead.reactor.monotonic() + pause)
-        self.toolhead.can_pause = True
-
     def request_external_force_stop(self, reason=None, immediate=False):
         if self.force_stop_requested:
             return
         self.force_stop_requested = True
         self.force_stop_reason = (
             reason or "Motor protection fault aborted homing")
-        if immediate:
-            self.handle_force_stop(pause=0.0, complete_drip=True)
-            return
-        self.handle_force_stop()
+        self._complete_drip_move()
 
     def homing_move(
         self,
@@ -206,6 +193,7 @@ class HomingMove:
                 )
                 endstop_triggers.append(wait)
             all_endstop_trigger = multi_complete(self.printer, endstop_triggers)
+            self.drip_completion = all_endstop_trigger
 
             self.toolhead.dwell(HOMING_START_DELAY)
             # Issue move
@@ -215,7 +203,6 @@ class HomingMove:
             except self.printer.command_error as e:
                 if not self.force_stop_requested:
                     error = "Error during homing move: %s" % (str(e),)
-                    self.handle_force_stop(pause=0.0, complete_drip=True)
             # Wait for endstops to trigger
             trigger_times = {}
             move_end_print_time = self.toolhead.get_last_move_time()
@@ -225,7 +212,6 @@ class HomingMove:
                 except self.printer.command_error as e:
                     if error is None and not self.force_stop_requested:
                         error = "Error during homing %s: %s" % (name, str(e))
-                        self.handle_force_stop(pause=0.0, complete_drip=True)
                     continue
                 if trigger_time > 0.0:
                     trigger_times[name] = trigger_time
@@ -234,13 +220,11 @@ class HomingMove:
                     and not self.force_stop_requested
                 ):
                     error = "Communication timeout during homing %s" % (name,)
-                    self.handle_force_stop(pause=0.0, complete_drip=True)
                 elif (
                     check_triggered and error is None
                     and not self.force_stop_requested
                 ):
                     error = "No trigger on %s after full movement" % (name,)
-                    self.handle_force_stop(pause=0.0, complete_drip=True)
             self.trigger_times = dict(trigger_times)
             self.triggered_endstops = tuple(sorted(trigger_times))
             # Determine stepper halt positions
@@ -306,6 +290,7 @@ class HomingMove:
                 raise self.printer.command_error(error)
             return trigpos
         finally:
+            self.drip_completion = None
             phoming._clear_active_hmove(self)
 
     def check_no_movement(self):
@@ -554,6 +539,9 @@ class PrinterHoming:
         self._session_aborted = False
         self._session_abort_result = None
         self._abort_in_progress = False
+        self._abort_cleanup_pending = False
+        self._abort_had_active_hmove = False
+        self._abort_z_align_aborted = False
         self._session_stall_mode_active = False
         self._xy_startup_prime_pending = True
         self._z_align_rise_prime_pending = True
@@ -650,6 +638,12 @@ class PrinterHoming:
     def _clear_active_hmove(self, hmove):
         if self.active_hmove is hmove:
             self.active_hmove = None
+            if self._abort_cleanup_pending:
+                self._abort_in_progress = True
+                try:
+                    self._finish_homing_abort()
+                finally:
+                    self._abort_in_progress = False
 
     def _normalize_session_axes(self, axes):
         if axes is None:
@@ -682,6 +676,9 @@ class PrinterHoming:
         self._session_aborted = False
         self._session_abort_result = None
         self._abort_in_progress = False
+        self._abort_cleanup_pending = False
+        self._abort_had_active_hmove = False
+        self._abort_z_align_aborted = False
         self._session_stall_mode_active = False
         self.motor_fault_abort_reason = None
         return True
@@ -693,6 +690,9 @@ class PrinterHoming:
         self._session_aborted = False
         self._session_abort_result = None
         self._abort_in_progress = False
+        self._abort_cleanup_pending = False
+        self._abort_had_active_hmove = False
+        self._abort_z_align_aborted = False
         self._session_stall_mode_active = False
         self.motor_fault_abort_reason = None
 
@@ -705,7 +705,7 @@ class PrinterHoming:
         return self._session_aborted
 
     def is_homing_abort_in_progress(self):
-        return self._abort_in_progress
+        return self._abort_in_progress or self._abort_cleanup_pending
 
     def _is_probe_model_ready(self):
         scanner = self.printer.lookup_object("cartographer", None)
@@ -735,7 +735,7 @@ class PrinterHoming:
     def _invalidate_kinematic_homing_state(self):
         toolhead = self.printer.lookup_object("toolhead")
         kin = toolhead.get_kinematics()
-        kin.clear_homing_state([0, 1, 2])
+        kin.clear_homing_state("xyz")
 
     def _mark_motor_control_not_homing(self):
         self.printer.lookup_object("motor_control").is_homing = False
@@ -746,77 +746,88 @@ class PrinterHoming:
             return True
         return bool(self._session_z_align)
 
+    def _build_homing_abort_result(
+            self, protection_after_clear=None, persistent_faults=None):
+        return {
+            "reason": self.motor_fault_abort_reason,
+            "axes": tuple(self._session_axes),
+            "active_hmove": self._abort_had_active_hmove,
+            "z_align_aborted": self._abort_z_align_aborted,
+            "cleanup_pending": self._abort_cleanup_pending,
+            "protection_after_clear": protection_after_clear or {},
+            "persistent_faults": persistent_faults or {},
+        }
+
+    def _finish_homing_abort(self):
+        try:
+            z_align = self.printer.lookup_object("z_align", None)
+            if z_align is not None:
+                z_align.invalidate_homing_state()
+            self._invalidate_kinematic_homing_state()
+            self._mark_motor_control_not_homing()
+        finally:
+            self.printer.lookup_object("stepper_enable").motor_off()
+        protection_after_clear = {}
+        persistent_faults = {}
+        try:
+            self._clear_kinematic_fault_latches(data=5)
+            protection_after_clear = self._query_kinematic_protection(
+                data=11, timeout=MOTOR_COMMAND_TIMEOUT)
+            persistent_faults = self._collect_active_faults(
+                protection_after_clear)
+        except Exception:
+            _klog(
+                "failed clearing/rechecking kinematic faults "
+                "after abort", level=logging.exception)
+        try:
+            self._restore_homing_stall_mode()
+        except Exception:
+            _klog(
+                "failed restoring MOTOR_STALL_MODE DATA=2 "
+                "after abort", level=logging.exception)
+        if persistent_faults:
+            self.motor_fault_abort_reason = (
+                "Persistent motor protection fault after abort cleanup (%s)"
+                % (self._format_fault_summary(persistent_faults),))
+        result = self._build_homing_abort_result(
+            protection_after_clear, persistent_faults)
+        result["cleanup_pending"] = False
+        self._session_abort_result = dict(result)
+        self._abort_cleanup_pending = False
+        return result
+
     def request_homing_abort(self, reason, detail=None, abort_z_align=True):
         if self._session_abort_result is not None:
             return dict(self._session_abort_result)
         if self._abort_in_progress:
-            return {
-                "reason": self.motor_fault_abort_reason or reason,
-                "axes": tuple(self._session_axes),
-                "active_hmove": self.active_hmove is not None,
-                "z_align_aborted": False,
-                "persistent_faults": {},
-            }
+            return self._build_homing_abort_result()
+        if self._session_aborted:
+            if self._abort_cleanup_pending and self.active_hmove is None:
+                self._abort_in_progress = True
+                try:
+                    return self._finish_homing_abort()
+                finally:
+                    self._abort_in_progress = False
+            return self._build_homing_abort_result()
         self._abort_in_progress = True
         self._session_aborted = True
         self.motor_fault_abort_reason = reason
         z_align = self.printer.lookup_object("z_align", None)
-        z_align_aborted = False
-        protection_after_clear = {}
-        persistent_faults = {}
         try:
             _klog(
                 "request_homing_abort reason=%s detail=%s",
                 reason, detail, level=logging.warning)
             if abort_z_align and z_align is not None:
-                z_align_aborted = bool(z_align.abort_internal(
+                self._abort_z_align_aborted = bool(z_align.abort_internal(
                     reason=reason, motor_off=False,
                     restore_motor_mode=False))
+            self._abort_had_active_hmove = self.active_hmove is not None
+            self._abort_cleanup_pending = True
             if self.active_hmove is not None:
                 self.active_hmove.request_external_force_stop(
                     reason=reason, immediate=True)
-            if z_align is not None:
-                z_align.invalidate_homing_state()
-            self._invalidate_kinematic_homing_state()
-            self._mark_motor_control_not_homing()
-            self.printer.lookup_object("stepper_enable").motor_off()
-            try:
-                self._clear_kinematic_fault_latches(data=5)
-                protection_after_clear = self._query_kinematic_protection(
-                    data=11, timeout=MOTOR_COMMAND_TIMEOUT)
-                persistent_faults = self._collect_active_faults(
-                    protection_after_clear)
-            except Exception:
-                _klog(
-                    "failed clearing/rechecking kinematic faults "
-                    "after abort", level=logging.exception)
-            try:
-                self._restore_homing_stall_mode()
-            except Exception:
-                _klog(
-                    "failed restoring MOTOR_STALL_MODE DATA=2 "
-                    "after abort", level=logging.exception)
-            try:
-                self.printer.lookup_object("stepper_enable").motor_off()
-            except Exception:
-                _klog(
-                    "failed final motor_off after abort cleanup",
-                    level=logging.exception)
-            if persistent_faults:
-                reason = (
-                    "Persistent motor protection fault after abort cleanup (%s)"
-                    % (self._format_fault_summary(persistent_faults),))
-                self.motor_fault_abort_reason = reason
-            result = {
-                "reason": self.motor_fault_abort_reason or reason,
-                "axes": tuple(self._session_axes),
-                "active_hmove": self.active_hmove is not None,
-                "z_align_aborted": z_align_aborted,
-                "protection_after_clear": protection_after_clear,
-                "persistent_faults": persistent_faults,
-            }
-            self._session_abort_result = dict(result)
-            return result
+                return self._build_homing_abort_result()
+            return self._finish_homing_abort()
         finally:
             self._abort_in_progress = False
 
@@ -993,7 +1004,7 @@ class PrinterHoming:
         toolhead = self.printer.lookup_object("toolhead")
         startpos = list(toolhead.get_position())
         startpos[axis_idx] = start_axis
-        toolhead.set_position(startpos, homing_axes=(axis_idx,))
+        toolhead.set_position(startpos, homing_axes="xyz"[axis_idx])
         primepos = list(startpos)
         primepos[axis_idx] = target_axis
         prime_speed = min(float(hi.speed), XY_STARTUP_PRIME_SPEED)
@@ -1129,6 +1140,9 @@ class PrinterHoming:
         kin = toolhead.get_kinematics()
         if self._session_aborted:
             reason = self.motor_fault_abort_reason or "Homing session aborted"
+            if self._abort_cleanup_pending and self.active_hmove is None:
+                self.request_homing_abort(
+                    reason, abort_z_align=False)
             self.end_homing_session()
             raise gcmd.error(reason)
         session_owned = False
@@ -1169,16 +1183,21 @@ class PrinterHoming:
         except Exception as err:
             _klog("%s", err, level=logging.exception)
             abort_reason = self.motor_fault_abort_reason
-            if self._session_active and not self._session_aborted:
+            if (
+                self._session_active
+                and (not self._session_aborted or self._abort_cleanup_pending)
+            ):
                 try:
                     self.request_homing_abort(
                         reason=self.motor_fault_abort_reason or str(err),
                         detail={"source": "cmd_G28", "error": str(err)},
                         abort_z_align=self._should_abort_z_align())
-                except Exception:
+                except Exception as cleanup_err:
                     _klog(
                         "unified abort failed during cmd_G28",
                         level=logging.exception)
+                    abort_reason = "Homing abort cleanup failed: %s" % (
+                        cleanup_err,)
             abort_reason = abort_reason or self.motor_fault_abort_reason
             if self.printer.is_shutdown():
                 raise self.printer.command_error(
@@ -1194,7 +1213,8 @@ class PrinterHoming:
                     _klog(
                         "failed restoring stall mode during final cleanup",
                         level=logging.exception)
-                self.end_homing_session()
+                if not self._abort_cleanup_pending:
+                    self.end_homing_session()
 
 
 def load_config(config):
