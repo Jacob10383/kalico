@@ -1103,6 +1103,12 @@ class PrinterHoming:
         kin.home(homing_state)
 
     def _integrated_home_z(self, homing_state, kin, z_was_homed=False):
+        # Clean before nozzle-contact homing; XY is already homed here.
+        if self.config.has_section("prtouch") and self.config.getsection(
+            "prtouch"
+        ).getboolean("register_as_probe", False):
+            self.printer.lookup_object("gcode").run_script_from_command(
+                "NOZZLE_CLEAN")
         z_align = self.printer.lookup_object("z_align", None)
         use_z_align = bool(z_align is not None and z_align.needs_prep())
         if use_z_align:

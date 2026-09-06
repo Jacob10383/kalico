@@ -186,6 +186,26 @@ class Calibrater:
             self.cmd_AXIS_TWIST_COMPENSATION_CALIBRATE,
             desc=self.cmd_AXIS_TWIST_COMPENSATION_CALIBRATE_help,
         )
+        self.gcode.register_command(
+            "AXIS_TWIST_COMPENSATION_CLEAR",
+            self.cmd_AXIS_TWIST_COMPENSATION_CLEAR,
+            desc=self.cmd_AXIS_TWIST_COMPENSATION_CLEAR_help,
+        )
+
+    cmd_AXIS_TWIST_COMPENSATION_CLEAR_help = (
+        "Clear stored axis twist compensation values "
+        "(both axes when AXIS is not given)"
+    )
+
+    def cmd_AXIS_TWIST_COMPENSATION_CLEAR(self, gcmd):
+        axis = gcmd.get("AXIS", None)
+        if axis is None:
+            self.compensation.clear_compensations()
+            return
+        axis = axis.upper()
+        if axis not in ("X", "Y"):
+            raise gcmd.error("AXIS must be X or Y")
+        self.compensation.clear_compensations(axis)
 
     cmd_AXIS_TWIST_COMPENSATION_CALIBRATE_help = """
     Performs the x twist calibration wizard
