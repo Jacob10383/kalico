@@ -3904,11 +3904,11 @@ a shutdown_speed equal to max_power.
 ### [controller_fan]
 
 Controller cooling fan (one may define any number of sections with a
-"controller_fan" prefix). A "controller fan" is a fan that will be
-enabled whenever its associated heater or its associated stepper
-driver is active. The fan will stop whenever an idle_timeout is
-reached to ensure no overheating will occur after deactivating a
-watched component.
+"controller_fan" prefix). A "controller fan" changes speed based on
+its associated heater or stepper driver. The fan runs at fan_speed
+while a watched component is active, then at idle_speed for
+idle_timeout seconds. After that timeout, and before the first watched
+activity after startup, the fan runs at standby_speed.
 
 ```
 [controller_fan my_controller_fan]
@@ -3929,13 +3929,17 @@ watched component.
 #   will be set to when a heater or stepper driver is active.
 #   The default is 1.0
 #idle_timeout:
-#   The amount of time (in seconds) after a stepper driver or heater
-#   was active and the fan should be kept running. The default
-#   is 30 seconds.
+#   The amount of time (in seconds) to use idle_speed after a stepper
+#   driver or heater becomes inactive. A value of 0 transitions
+#   directly to standby_speed. The default is 30 seconds.
 #idle_speed:
 #   The fan speed (expressed as a value from 0.0 to 1.0) that the fan
-#   will be set to when a heater or stepper driver was active and
-#   before the idle_timeout is reached. The default is fan_speed.
+#   will be set to after a heater or stepper driver becomes inactive
+#   and before the idle_timeout is reached. The default is fan_speed.
+#standby_speed: 0.0
+#   The fan speed (expressed as a value from 0.0 to 1.0) that the fan
+#   will be set to before the first heater or stepper driver activity
+#   and after idle_timeout is reached. The default is 0.0.
 #heater:
 #stepper:
 #   Name of the config section defining the heater/stepper that this fan
