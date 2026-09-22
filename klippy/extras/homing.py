@@ -28,8 +28,8 @@ XY_STARTUP_PRIME_DIST = 0.1
 XY_STARTUP_PRIME_SPEED = 20.0
 XY_STARTUP_PRIME_ENDSTOP_MARGIN = 5.0
 XY_RETRIGGER_MISMATCH_TOLERANCE_MM = 1.0
-Z_REHOME_CLEARANCE = 5.0
-Z_REHOME_CLEARANCE_SPEED = 20.0
+Z_REHOME_APPROACH_HEIGHT = 5.0
+Z_REHOME_APPROACH_SPEED = 20.0
 Z_POST_HOME_LIFT = 3.0
 Z_POST_HOME_LIFT_SPEED = 10.0
 
@@ -958,12 +958,6 @@ class PrinterHoming:
             return [0, 1, 2]
         return axes
 
-    def _get_homed_axis_letters(self):
-        toolhead = self.printer.lookup_object("toolhead")
-        eventtime = self.printer.get_reactor().monotonic()
-        homed_axes = toolhead.get_status(eventtime).get("homed_axes", "")
-        return set(axis.lower() for axis in homed_axes)
-
     def _resolve_home_order(self, requested_axes, homed_axes):
         requested = set(requested_axes)
         order = []
@@ -1058,23 +1052,23 @@ class PrinterHoming:
         _klog("%s", msg, level=logging.warning)
         self.printer.lookup_object("gcode").respond_raw(msg)
 
-    def _move_known_z_to_clearance_before_home(self, kin):
+    def _lower_known_z_to_approach_height_before_home(self, kin):
         toolhead = self.printer.lookup_object("toolhead")
         pos = list(toolhead.get_position())
         current_z = pos[2]
-        if current_z <= Z_REHOME_CLEARANCE:
+        if current_z <= Z_REHOME_APPROACH_HEIGHT:
             return False
         endstops = self._get_z_home_endstops(kin)
         start_triggered = self._get_triggered_endstop_names(
             endstops, toolhead.get_last_move_time())
         target = list(pos)
-        target[2] = Z_REHOME_CLEARANCE
+        target[2] = Z_REHOME_APPROACH_HEIGHT
         _klog(
-            "moving known Z %.3f -> %.3f before G28 Z at %.3fmm/s",
-            current_z, Z_REHOME_CLEARANCE, Z_REHOME_CLEARANCE_SPEED)
+            "lowering known Z %.3f -> %.3f before G28 Z at %.3fmm/s",
+            current_z, Z_REHOME_APPROACH_HEIGHT, Z_REHOME_APPROACH_SPEED)
         hmove = HomingMove(self.printer, endstops, toolhead)
         hmove.homing_move(
-            target, Z_REHOME_CLEARANCE_SPEED,
+            target, Z_REHOME_APPROACH_SPEED,
             triggered=True, check_triggered=False)
         if hmove.triggered_endstops:
             triggered_set = set(hmove.triggered_endstops)
@@ -1090,7 +1084,7 @@ class PrinterHoming:
                     "move from Z=%.3f to Z=%.3f (%s); continuing with normal "
                     "G28 Z"
                     % (
-                        current_z, Z_REHOME_CLEARANCE,
+                        current_z, Z_REHOME_APPROACH_HEIGHT,
                         ",".join(sorted(triggered_set))))
             self._emit_raw_warning(msg)
             return False
@@ -1102,19 +1096,19 @@ class PrinterHoming:
         homing_state.set_axes([axis_idx])
         kin.home(homing_state)
 
-    def _integrated_home_z(self, homing_state, kin, z_was_homed=False):
+    def _integrated_home_z(
+            self, homing_state, kin, z_align, z_was_homed):
         # Clean before nozzle-contact homing; XY is already homed here.
         if self.config.has_section("prtouch") and self.config.getsection(
             "prtouch"
         ).getboolean("register_as_probe", False):
             self.printer.lookup_object("gcode").run_script_from_command(
                 "NOZZLE_CLEAN")
-        z_align = self.printer.lookup_object("z_align", None)
-        use_z_align = bool(z_align is not None and z_align.needs_prep())
-        if use_z_align:
+        if z_align is not None:
             z_align.wait_prepare_complete()
         self._move_to_z_home_center(speed=200.0)
-        if use_z_align:
+        # Approach using the Z path selected before XY travel.
+        if z_align is not None:
             if not self._is_probe_model_ready():
                 z_align.perform_unmonitored_rise()
                 raise HomingZProbeNotCalibrated("Scan model not loaded")
@@ -1123,10 +1117,11 @@ class PrinterHoming:
                 raise self.printer.command_error(
                     self.motor_fault_abort_reason or "Homing session aborted")
         elif z_was_homed:
-            self._move_known_z_to_clearance_before_home(kin)
+            self._lower_known_z_to_approach_height_before_home(kin)
         if not self._is_probe_model_ready():
             raise HomingZProbeNotCalibrated("Scan model not loaded")
         self._check_scanner_connected()
+
         homing_state.set_axes([2])
         kin.home(homing_state)
         # Lift Z to a known clearance after a successful home so it is not left
@@ -1153,13 +1148,18 @@ class PrinterHoming:
             raise gcmd.error(reason)
         session_owned = False
         try:
-            homed_axes = self._get_homed_axis_letters()
+            eventtime = self.printer.get_reactor().monotonic()
+            homed_axes = kin.get_status(eventtime)["homed_axes"]
             order = self._resolve_home_order(axes, homed_axes)
             z_align = self.printer.lookup_object("z_align", None)
             use_z_align = bool(
                 2 in order
                 and z_align is not None
                 and z_align.needs_prep())
+            # Keep the selected Z path through preparation and probing.
+            if not use_z_align:
+                z_align = None
+            z_was_homed = "z" in homed_axes
             if not self._session_active:
                 requested_axes = "".join("XYZ"[axis] for axis in order)
                 # We own the session from the moment we request it: a fault
@@ -1168,14 +1168,14 @@ class PrinterHoming:
                 session_owned = True
                 self._start_managed_homing_session(
                     requested_axes, z_align=use_z_align)
-            if use_z_align:
+            if z_align is not None:
                 z_align.start_prepare()
             for axis_idx in order:
                 if axis_idx in (0, 1):
                     self._home_single_axis(homing_state, kin, axis_idx)
                 else:
                     self._integrated_home_z(
-                        homing_state, kin, z_was_homed=("z" in homed_axes))
+                        homing_state, kin, z_align, z_was_homed)
             if session_owned:
                 self._finish_managed_homing_session()
         except HomingZProbeNotCalibrated as err:
