@@ -28,6 +28,8 @@ XY_STARTUP_PRIME_DIST = 0.1
 XY_STARTUP_PRIME_SPEED = 20.0
 XY_STARTUP_PRIME_ENDSTOP_MARGIN = 5.0
 XY_RETRIGGER_MISMATCH_TOLERANCE_MM = 1.0
+Z_REHOME_TRAVEL_CLEARANCE = 5.0
+Z_REHOME_LIFT_SPEED = 20.0
 Z_REHOME_APPROACH_HEIGHT = 5.0
 Z_REHOME_APPROACH_SPEED = 20.0
 Z_POST_HOME_LIFT = 3.0
@@ -1052,6 +1054,21 @@ class PrinterHoming:
         _klog("%s", msg, level=logging.warning)
         self.printer.lookup_object("gcode").respond_raw(msg)
 
+    def _lift_known_z_before_rehome_travel(self):
+        # Only called for already-homed Z without photoelectric preparation.
+        toolhead = self.printer.lookup_object("toolhead")
+        pos = list(toolhead.get_position())
+        if pos[2] >= Z_REHOME_TRAVEL_CLEARANCE:
+            return
+        _klog(
+            "lifting known Z %.3f -> %.3f before rehome travel",
+            pos[2], Z_REHOME_TRAVEL_CLEARANCE)
+        pos[2] = Z_REHOME_TRAVEL_CLEARANCE
+        # Move away from the bed even if the probe is already triggered.
+        toolhead.move(pos, Z_REHOME_LIFT_SPEED)
+        toolhead.wait_moves()
+        self.printer.lookup_object("gcode_move").reset_last_position()
+
     def _lower_known_z_to_approach_height_before_home(self, kin):
         toolhead = self.printer.lookup_object("toolhead")
         pos = list(toolhead.get_position())
@@ -1170,6 +1187,9 @@ class PrinterHoming:
                     requested_axes, z_align=use_z_align)
             if z_align is not None:
                 z_align.start_prepare()
+            elif 2 in order and z_was_homed:
+                # Clear the bed before XY homing, cleaning, or center travel.
+                self._lift_known_z_before_rehome_travel()
             for axis_idx in order:
                 if axis_idx in (0, 1):
                     self._home_single_axis(homing_state, kin, axis_idx)
