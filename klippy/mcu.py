@@ -18,6 +18,8 @@ class error(Exception):
 
 # Minimum time host needs to get scheduled events queued into mcu
 MIN_SCHEDULE_TIME = 0.100
+# Like MIN_SCHEDULE_TIME, but used during MCU initialization
+MIN_SCHEDULE_TIME_INIT = 0.200
 # The maximum number of clock cycles an MCU is expected
 # to schedule into the future, due to the protocol and firmware.
 MAX_SCHEDULE_TICKS = (1 << 31) - 1
@@ -441,9 +443,17 @@ class MCU_endstop:
             cq=cmd_queue,
         )
 
+    def _check_connected(self):
+        if self._mcu.non_critical_disconnected:
+            raise self._mcu.get_printer().command_error(
+                f"Cannot use endstop on disconnected MCU "
+                f"'{self._mcu.get_name()}'"
+            )
+
     def home_start(
         self, print_time, sample_time, sample_count, rest_time, triggered=True
     ):
+        self._check_connected()
         clock = self._mcu.print_time_to_clock(print_time)
         rest_ticks = (
             self._mcu.print_time_to_clock(print_time + rest_time) - clock
@@ -481,6 +491,7 @@ class MCU_endstop:
         return self._mcu.clock_to_print_time(next_clock - self._rest_ticks)
 
     def query_endstop(self, print_time):
+        self._check_connected()
         clock = self._mcu.print_time_to_clock(print_time)
         if self._mcu.is_fileoutput():
             return 0
@@ -598,7 +609,9 @@ class MCU_pwm:
         cmd_queue = self._mcu.alloc_command_queue()
         curtime = self._mcu.get_printer().get_reactor().monotonic()
         printtime = self._mcu.estimated_print_time(curtime)
-        self._last_clock = self._mcu.print_time_to_clock(printtime + 0.200)
+        self._last_clock = self._mcu.print_time_to_clock(
+            printtime + MIN_SCHEDULE_TIME_INIT
+        )
         cycle_ticks = self._mcu.seconds_to_clock(self._cycle_time)
         mdur_ticks = self._mcu.seconds_to_clock(self._max_duration)
         if mdur_ticks > MAX_SCHEDULE_TICKS:
@@ -663,10 +676,12 @@ class MCU_pwm:
         )
 
     def set_pwm(self, print_time, value):
+        clock = self._mcu.print_time_to_clock(print_time)
+        if clock < self._last_clock and not self._mcu.is_fileoutput():
+            raise error("Tried to set PWM target before last update")
         if self._invert:
             value = 1.0 - value
         v = int(max(0.0, min(1.0, value)) * self._pwm_max + 0.5)
-        clock = self._mcu.print_time_to_clock(print_time)
         self._set_cmd.send(
             [self._oid, clock, v], minclock=self._last_clock, reqclock=clock
         )
@@ -817,14 +832,10 @@ class MCU:
         self._init_cmds = []
         self._mcu_freq = 0.0
         # Move command queuing
-        ffi_main, self._ffi_lib = chelper.get_ffi()
         self._max_stepper_error = config.getfloat(
             "max_stepper_error", 0.000025, minval=0.0
         )
         self._reserved_move_slots = 0
-        self._stepqueues = []
-        self._steppersync = None
-        self._flush_callbacks = []
         # Stats
         self._get_status_info = {}
         self._stats_sumsq_base = 0.0
@@ -986,6 +997,11 @@ class MCU:
             self.estimated_print_time = dummy_estimated_print_time
 
     def handle_non_critical_disconnect(self):
+        if self.non_critical_disconnected:
+            # motion_queuing.stats() keeps calling calibrate_clock() (and
+            # thus _check_timeout()) while the mcu is disconnected; only
+            # handle the first disconnect notification
+            return
         self.non_critical_disconnected = True
         self._clocksync.disconnect()
         self._disconnect()
@@ -1195,17 +1211,11 @@ class MCU:
         move_count = config_params["move_count"]
         if move_count < self._reserved_move_slots:
             raise error("Too few moves available on MCU '%s'" % (self._name,))
-        ffi_main, ffi_lib = chelper.get_ffi()
-        self._steppersync = ffi_main.gc(
-            ffi_lib.steppersync_alloc(
-                self._serial.get_serialqueue(),
-                self._stepqueues,
-                len(self._stepqueues),
-                move_count - self._reserved_move_slots,
-            ),
-            ffi_lib.steppersync_free,
+        ss_move_count = move_count - self._reserved_move_slots
+        motion_queuing = self._printer.lookup_object("motion_queuing")
+        motion_queuing.setup_mcu_movequeue(
+            self, self._serial.get_serialqueue(), ss_move_count
         )
-        ffi_lib.steppersync_set_time(self._steppersync, 0.0, self._mcu_freq)
         # Log config information
         move_msg = "Configured MCU '%s' (%d moves)" % (self._name, move_count)
         logging.info(move_msg)
@@ -1436,7 +1446,6 @@ class MCU:
     # Restarts
     def _disconnect(self):
         self._serial.disconnect()
-        self._steppersync = None
 
     def _shutdown(self, force=False):
         if (
@@ -1504,39 +1513,10 @@ class MCU:
         self._firmware_restart(True)
 
     # Move queue tracking
-    def register_stepqueue(self, stepqueue):
-        self._stepqueues.append(stepqueue)
-
     def request_move_queue_slot(self):
         self._reserved_move_slots += 1
 
-    def register_flush_callback(self, callback):
-        self._flush_callbacks.append(callback)
-
-    def flush_moves(self, print_time, clear_history_time):
-        if self._steppersync is None:
-            return
-        clock = self.print_time_to_clock(print_time)
-        if clock < 0:
-            return
-        for cb in self._flush_callbacks:
-            cb(print_time, clock)
-        clear_history_clock = max(
-            0, self.print_time_to_clock(clear_history_time)
-        )
-        ret = self._ffi_lib.steppersync_flush(
-            self._steppersync, clock, clear_history_clock
-        )
-        if ret:
-            raise error(
-                "Internal error in MCU '%s' stepcompress" % (self._name,)
-            )
-
-    def check_active(self, print_time, eventtime):
-        if self._steppersync is None:
-            return
-        offset, freq = self._clocksync.calibrate_clock(print_time, eventtime)
-        self._ffi_lib.steppersync_set_time(self._steppersync, offset, freq)
+    def _check_timeout(self, eventtime):
         if (
             self._clocksync.is_active()
             or self.is_fileoutput()
@@ -1561,6 +1541,11 @@ class MCU:
         self._printer.invoke_shutdown(
             "Lost communication with MCU '%s'" % (self._name,)
         )
+
+    def calibrate_clock(self, print_time, eventtime):
+        offset, freq = self._clocksync.calibrate_clock(print_time, eventtime)
+        self._check_timeout(eventtime)
+        return offset, freq
 
     # Misc external commands
     def is_fileoutput(self):
