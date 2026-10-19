@@ -21,7 +21,7 @@
       
       
       <link rel="icon" href="logo/kalico-32x32.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
     
     
       
@@ -29,7 +29,7 @@
       
     
     
-      <link rel="stylesheet" href="assets/stylesheets/main.484c7ddc.min.css">
+      <link rel="stylesheet" href="assets/stylesheets/main.ec1eaa64.min.css">
       
         
         <link rel="stylesheet" href="assets/stylesheets/palette.ab4e12ef.min.css">
@@ -1179,17 +1179,6 @@
       
         <li class="md-nav__item">
   <a href="#gcode_button" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        gcode_button
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#gcode_button_1" class="md-nav__link">
     <span class="md-ellipsis">
       
         gcode_button
@@ -3508,17 +3497,6 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#gcode_button_1" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        gcode_button
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
   <a href="#gcode_macro" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -4216,12 +4194,6 @@ objects:</p>
 <ul>
 <li><code>state</code>: The current button state returned as "PRESSED" or "RELEASED"</li>
 </ul>
-<h2 id="gcode_button_1">gcode_button<a class="headerlink" href="#gcode_button_1" title="Permanent link">&para;</a></h2>
-<p>The following information is available in
-<a href="Config_Reference.html#gcode_button">gcode_button some_name</a> objects:</p>
-<ul>
-<li><code>state</code>: The current button state returned as "PRESSED" or "RELEASED"</li>
-</ul>
 <h2 id="gcode_macro">gcode_macro<a class="headerlink" href="#gcode_macro" title="Permanent link">&para;</a></h2>
 <p>The following information is available in
 <a href="Config_Reference.html#gcode_macro">gcode_macro some_name</a> objects:</p>
@@ -4312,6 +4284,9 @@ is always available):</p>
 <li><code>printing_time</code>: The amount of time (in seconds) the printer has
   been in the "Printing" state (as tracked by the idle_timeout
   module).</li>
+<li><code>idle_timeout</code>: The current 'timeout' (in seconds)
+   to wait for the gcode to be triggered.
+   (as set by <a href="G-Codes.html#set_idle_timeout">SET_IDLE_TIMEOUT</a>)</li>
 </ul>
 <h2 id="indx">indx<a class="headerlink" href="#indx" title="Permanent link">&para;</a></h2>
 <p>The following information is available in the
@@ -4340,8 +4315,11 @@ is always available):</p>
 <li>'is_calibrated': True/False is the load cell calibrated</li>
 <li>'counts_per_gram': The number of raw sensor counts that equals 1 gram of force</li>
 <li>'reference_tare_counts': The reference number of raw sensor counts for 0 force</li>
+<li>'reference_tare_counts_per_channel': The reference number of raw sensor counts for 0 force as an array, one entry per channel</li>
 <li>'tare_counts': The current number of raw sensor counts for 0 force</li>
+<li>'tare_counts_per_channel': The current number of raw sensor counts for 0 force as an array, one entry per channel</li>
 <li>'force_g': The force in grams, averaged over the last polling period.</li>
+<li>'force_g_per_channel': The force in grams, averaged over the last polling period, one entry per channel</li>
 <li>'min_force_g': The minimum force in grams, over the last polling period.</li>
 <li>'max_force_g': The maximum force in grams, over the last polling period.</li>
 </ul>
@@ -4766,7 +4744,7 @@ object is available if z_tilt is defined):</p>
       <script id="__config" type="application/json">{"annotate": null, "base": ".", "features": ["navigation.top", "navigation.instant", "navigation.instant.prefetch", "navigation.instant.progress", "navigation.tracking", "toc.follow", "search.suggest", "search.highlight", "search.share", "content.action.edit", "optimize"], "search": "assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="assets/javascripts/bundle.79ae519e.min.js"></script>
+      <script src="assets/javascripts/bundle.d7400e89.min.js"></script>
       
     
   </body>
