@@ -291,11 +291,6 @@ class MCU_I2C:
             [self.oid, data], minclock=minclock, reqclock=reqclock
         )
 
-    def i2c_write_wait_ack(self, data, minclock=0, reqclock=0):
-        self.i2c_write_cmd.send_wait_ack(
-            [self.oid, data], minclock=minclock, reqclock=reqclock
-        )
-
     def i2c_read(self, write, read_len, retry=True):
         return self.i2c_read_cmd.send([self.oid, write, read_len], retry)
 
@@ -319,6 +314,11 @@ def MCU_I2C_from_config(config, default_addr=None, default_speed=100000):
             ppins.lookup_pin(config.get(name), share_type=name)
             for name in sw_pin_names
         ]
+        for pin_params in sw_pin_params:
+            if pin_params["chip"] != i2c_mcu:
+                raise ppins.error(
+                    "%s: i2c pins must be on same mcu" % (config.get_name(),)
+                )
         sw_pins = tuple([pin_params["pin"] for pin_params in sw_pin_params])
         bus = None
     else:
