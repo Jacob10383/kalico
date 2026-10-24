@@ -430,6 +430,9 @@ class LoadCellSampleCollector:
         self._samples = []
         self._errors = 0
         self._overflows = 0
+        # sensors report running totals, track the last totals seen
+        self._last_errors = 0
+        self._last_overflows = 0
 
     # move from the started to stopped state and trigger the completion
     def _complete(self):
@@ -441,8 +444,15 @@ class LoadCellSampleCollector:
     def _on_samples(self, msg):
         if not self.is_started:
             return False  # already stopped, ignore
-        self._errors += msg["errors"]
-        self._overflows += msg["overflows"]
+        errors, overflows = msg["errors"] or 0, msg["overflows"] or 0
+        # a total lower than the last one means the sensor restarted
+        self._errors += errors - self._last_errors
+        if errors < self._last_errors:
+            self._errors += self._last_errors
+        self._overflows += overflows - self._last_overflows
+        if overflows < self._last_overflows:
+            self._overflows += self._last_overflows
+        self._last_errors, self._last_overflows = errors, overflows
         samples = msg["data"]
         for sample in samples:
             time = sample[0]
@@ -477,10 +487,12 @@ class LoadCellSampleCollector:
             self._completion = self._reactor.completion()
             result = self._completion.wait(waketime=wake_time)
             if result is None:
-                self._finish_collecting()
+                samples, err = self._finish_collecting()
+                errors, overflows = err if err else (0, 0)
                 raise self._printer.command_error(
-                    f"LoadCellSampleCollector timed out! Errors: {self._errors},"
-                    f" Overflows: {self._overflows}"
+                    f"LoadCellSampleCollector timed out! Collected "
+                    f"{len(samples)} samples, Errors: {errors},"
+                    f" Overflows: {overflows}"
                 )
         return self._finish_collecting()
 
@@ -490,6 +502,8 @@ class LoadCellSampleCollector:
             return
         self.min_time = min_time if min_time is not None else self.min_time
         self.is_started = True
+        totals = self._load_cell.get_sensor_totals()
+        self._last_errors, self._last_overflows = totals
         self._load_cell.add_client(self._on_samples)
 
     # stop collecting immediately and return results
@@ -640,6 +654,8 @@ class LoadCell:
         LoadCellCommandHelper(config, self)
         # Client support:
         self.clients = ApiClientHelper(printer)
+        # running error and overflow totals from the last sensor batch
+        self._sensor_totals = (0, 0)
         header = {"header": SampleStructure.header_labels(self.channel_count)}
         self.clients.add_mux_endpoint(
             "load_cell/dump_force", "load_cell", self.name, header
@@ -690,9 +706,13 @@ class LoadCell:
                 )
                 sample.append(counts)
             samples.append(sample)
+        self._sensor_totals = (errors or 0, overflows or 0)
         msg = {"data": samples, "errors": errors, "overflows": overflows}
         self.clients.send(msg)
         return True
+
+    def get_sensor_totals(self):
+        return self._sensor_totals
 
     # get internal events of force data
     def add_client(self, callback):
