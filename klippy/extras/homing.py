@@ -24,9 +24,6 @@ class HomingZProbeNotCalibrated(Exception):
 HOMING_START_DELAY = 0.001
 ENDSTOP_SAMPLE_TIME = 0.000015
 ENDSTOP_SAMPLE_COUNT = 4
-XY_STARTUP_PRIME_DIST = 0.1
-XY_STARTUP_PRIME_SPEED = 20.0
-XY_STARTUP_PRIME_ENDSTOP_MARGIN = 5.0
 XY_RETRIGGER_MISMATCH_TOLERANCE_MM = 1.0
 Z_REHOME_TRAVEL_CLEARANCE = 5.0
 Z_REHOME_LIFT_SPEED = 20.0
@@ -545,34 +542,6 @@ class PrinterHoming:
         self._abort_had_active_hmove = False
         self._abort_z_align_aborted = False
         self._session_stall_mode_active = False
-        self._xy_startup_prime_pending = True
-        self._z_align_rise_prime_pending = True
-        self.printer.register_event_handler(
-            "klippy:connect", self._handle_connect)
-        self.printer.register_event_handler(
-            "gcode:request_restart", self._handle_request_restart)
-
-    def _reset_startup_motion_primes(self):
-        self._xy_startup_prime_pending = True
-        self._z_align_rise_prime_pending = True
-
-    def _handle_connect(self):
-        self._reset_startup_motion_primes()
-
-    def _handle_request_restart(self, _print_time):
-        self._reset_startup_motion_primes()
-
-    def consume_xy_startup_prime(self):
-        if not self._xy_startup_prime_pending:
-            return False
-        self._xy_startup_prime_pending = False
-        return True
-
-    def consume_z_align_rise_startup_prime(self):
-        if not self._z_align_rise_prime_pending:
-            return False
-        self._z_align_rise_prime_pending = False
-        return True
 
     def _lookup_motor_control(self):
         return self.printer.lookup_object("motor_control")
@@ -980,37 +949,6 @@ class PrinterHoming:
         pos_max = section.getfloat("position_max")
         return pos_min, pos_max
 
-    def _prime_xy_home_once_after_restart(self, kin, axis_idx):
-        if axis_idx not in (0, 1):
-            return
-        rail = kin.rails[axis_idx]
-        hi = rail.get_homing_info()
-        pos_min, pos_max = rail.get_range()
-        direction = 1.0 if getattr(hi, "positive_dir", False) else -1.0
-        margin = min(XY_STARTUP_PRIME_ENDSTOP_MARGIN, XY_STARTUP_PRIME_DIST)
-        target_axis = hi.position_endstop - direction * margin
-        target_axis = max(pos_min, min(pos_max, target_axis))
-        start_axis = target_axis - direction * XY_STARTUP_PRIME_DIST
-        start_axis = max(pos_min, min(pos_max, start_axis))
-        prime_dist = abs(target_axis - start_axis)
-        if prime_dist <= 0.0:
-            return
-        if not self.consume_xy_startup_prime():
-            return
-        toolhead = self.printer.lookup_object("toolhead")
-        startpos = list(toolhead.get_position())
-        startpos[axis_idx] = start_axis
-        toolhead.set_position(startpos, homing_axes="xyz"[axis_idx])
-        primepos = list(startpos)
-        primepos[axis_idx] = target_axis
-        prime_speed = min(float(hi.speed), XY_STARTUP_PRIME_SPEED)
-        _klog(
-            "priming first %s home after restart dist=%.3f speed=%.3f",
-            rail.get_name(), prime_dist, prime_speed)
-        prime_hmove = HomingMove(self.printer, rail.get_endstops())
-        prime_hmove.homing_move(
-            primepos, prime_speed, triggered=True, check_triggered=False)
-
     def _compute_z_home_center(self):
         if self.config.has_section("bed_mesh"):
             bed_mesh = self.config.getsection("bed_mesh")
@@ -1108,8 +1046,6 @@ class PrinterHoming:
         return True
 
     def _home_single_axis(self, homing_state, kin, axis_idx):
-        if axis_idx in (0, 1):
-            self._prime_xy_home_once_after_restart(kin, axis_idx)
         homing_state.set_axes([axis_idx])
         kin.home(homing_state)
 
