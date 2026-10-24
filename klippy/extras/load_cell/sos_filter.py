@@ -24,7 +24,7 @@ def assert_is_int32(value: int, error: str) -> int:
 # checks for overflow
 def to_fixed_32(value: int, int_bits: int) -> int:
     fractional_bits = 32 - (1 + int_bits)
-    fixed_val = int(value * (2**fractional_bits))
+    fixed_val = int(round(value * (2**fractional_bits)))
     return assert_is_int32(fixed_val, "Fixed point Q%i overflow" % (int_bits,))
 
 
