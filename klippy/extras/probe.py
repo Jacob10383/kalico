@@ -490,42 +490,55 @@ class PrinterProbe:
         )
         # Register PROBE/QUERY_PROBE commands
         self.gcode = self.printer.lookup_object("gcode")
-        self.register_commands(self.probe_name)
         if self.is_default_probe:
+            self.register_commands(self.probe_name)
             self.register_commands(None)
+        else:
+            # A probe plugin outside Kalico (such as Cartographer) may own
+            # the plain commands; register after it so it keeps them
+            self.printer.register_event_handler(
+                "klippy:connect", self._register_named_commands
+            )
 
-    def register_commands(self, key):
-        self.gcode.register_mux_command(
-            "PROBE", "PROBE", key, self.cmd_PROBE, desc=self.cmd_PROBE_help
+    def _register_named_commands(self):
+        self.register_commands(self.probe_name, skip_taken=True)
+
+    def register_commands(self, key, skip_taken=False):
+        commands = (
+            ("PROBE", self.cmd_PROBE, self.cmd_PROBE_help),
+            ("QUERY_PROBE", self.cmd_QUERY_PROBE, self.cmd_QUERY_PROBE_help),
+            (
+                "PROBE_CALIBRATE",
+                self.cmd_PROBE_CALIBRATE,
+                self.cmd_PROBE_CALIBRATE_help,
+            ),
+            (
+                "PROBE_ACCURACY",
+                self.cmd_PROBE_ACCURACY,
+                self.cmd_PROBE_ACCURACY_help,
+            ),
+            (
+                "Z_OFFSET_APPLY_PROBE",
+                self.cmd_Z_OFFSET_APPLY_PROBE,
+                self.cmd_Z_OFFSET_APPLY_PROBE_help,
+            ),
         )
-        self.gcode.register_mux_command(
-            "QUERY_PROBE",
-            "PROBE",
-            key,
-            self.cmd_QUERY_PROBE,
-            desc=self.cmd_QUERY_PROBE_help,
-        )
-        self.gcode.register_mux_command(
-            "PROBE_CALIBRATE",
-            "PROBE",
-            key,
-            self.cmd_PROBE_CALIBRATE,
-            desc=self.cmd_PROBE_CALIBRATE_help,
-        )
-        self.gcode.register_mux_command(
-            "PROBE_ACCURACY",
-            "PROBE",
-            key,
-            self.cmd_PROBE_ACCURACY,
-            desc=self.cmd_PROBE_ACCURACY_help,
-        )
-        self.gcode.register_mux_command(
-            "Z_OFFSET_APPLY_PROBE",
-            "PROBE",
-            key,
-            self.cmd_Z_OFFSET_APPLY_PROBE,
-            desc=self.cmd_Z_OFFSET_APPLY_PROBE_help,
-        )
+        for cmd, func, desc in commands:
+            if (
+                skip_taken
+                and cmd in self.gcode.ready_gcode_handlers
+                and cmd not in self.gcode.mux_commands
+            ):
+                logging.info(
+                    "probe %s: %s belongs to another module; skipping"
+                    " %s PROBE=%s",
+                    self.probe_name,
+                    cmd,
+                    cmd,
+                    self.probe_name,
+                )
+                continue
+            self.gcode.register_mux_command(cmd, "PROBE", key, func, desc=desc)
 
     def _handle_homing_move_begin(self, hmove):
         if self.mcu_probe in hmove.get_mcu_endstops():
