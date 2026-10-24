@@ -285,6 +285,7 @@ class ContinuousTareFilter:
 class ContinuousTareFilterHelper:
     def __init__(self, config, sensor, cmd_queue):
         self._sensor = sensor
+        self._command_error = config.get_printer().command_error
         self._sps = self._sensor.get_samples_per_second()
         max_filter_frequency = math.floor(self._sps / 2.0)
         # setup filter parameters
@@ -357,9 +358,9 @@ class ContinuousTareFilterHelper:
         if self._active_design == gcmd_filter:
             return
         # update MCU filter from GCode command
-        self._sos_filter.change_filter(
-            self._active_design.design_filter(gcmd.error)
-        )
+        error = gcmd.error if gcmd is not None else self._command_error
+        self._sos_filter.change_filter(gcmd_filter.design_filter(error))
+        self._active_design = gcmd_filter
 
     def get_sos_filter(self) -> sos_filter.SosFilter:
         return self._sos_filter
