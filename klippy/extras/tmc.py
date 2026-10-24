@@ -119,7 +119,7 @@ class FieldHelper:
 
 
 class TMCErrorCheck:
-    def __init__(self, config, mcu_tmc):
+    def __init__(self, config, mcu_tmc, temp_from_adc=None):
         self.printer = config.get_printer()
         name_parts = config.get_name().split()
         self.stepper_name = " ".join(name_parts[1:])
@@ -127,6 +127,17 @@ class TMCErrorCheck:
         self.fields = mcu_tmc.get_fields()
         self.check_timer = None
         self.last_drv_status = self.last_drv_fields = None
+        # A non-critical mcu only counts as back once its config is resent
+        self.mcu_offline = False
+        mcu = mcu_tmc.get_mcu()
+        self.printer.register_event_handler(
+            mcu.get_non_critical_disconnect_event_name(),
+            self._handle_mcu_offline,
+        )
+        self.printer.register_event_handler(
+            mcu.get_non_critical_reconnect_event_name(),
+            self._handle_mcu_online,
+        )
         # Setup for GSTAT query
         reg_name = self.fields.lookup_register("drv_err")
         if reg_name is not None:
@@ -158,6 +169,7 @@ class TMCErrorCheck:
         # Setup for temperature query
         self.adc_temp = None
         self.adc_temp_reg = self.fields.lookup_register("adc_temp")
+        self.temp_from_adc = temp_from_adc
         if self.adc_temp_reg is not None:
             pheaters = self.printer.load_object(config, "heaters")
             pheaters.register_monitor(config)
@@ -212,7 +224,16 @@ class TMCErrorCheck:
             self.adc_temp = None
             return
 
+    def _handle_mcu_offline(self):
+        self.mcu_offline = True
+
+    def _handle_mcu_online(self):
+        self.mcu_offline = False
+
     def _do_periodic_check(self, eventtime):
+        mcu = self.mcu_tmc.get_mcu()
+        if self.mcu_offline or mcu.non_critical_disconnected:
+            return eventtime + 1.0
         try:
             self._query_register(self.drv_status_reg_info)
             if self.gstat_reg_info is not None:
@@ -220,6 +241,9 @@ class TMCErrorCheck:
             if self.adc_temp_reg is not None:
                 self._query_temperature()
         except self.printer.command_error as e:
+            # A non-critical mcu dropping mid-query is not a driver fault
+            if mcu.non_critical_disconnected:
+                return eventtime + 1.0
             self.printer.invoke_shutdown(str(e))
             return self.printer.get_reactor().NEVER
         return eventtime + 1.0
@@ -255,7 +279,8 @@ class TMCErrorCheck:
             return {"drv_status": None, "temperature": None}
         temp = None
         if self.adc_temp is not None:
-            temp = round((self.adc_temp - 2038) / 7.7, 2)
+            adc = self.fields.get_field("adc_temp", self.adc_temp)
+            temp = round(self.temp_from_adc(adc), 2)
         last_value, reg_name = self.drv_status_reg_info[:2]
         if last_value != self.last_drv_status:
             self.last_drv_status = last_value
@@ -367,12 +392,20 @@ class TMCStallguardDump:
 
 
 class TMCCommandHelper:
-    def __init__(self, config, mcu_tmc, current_helper):
+    def __init__(
+        self,
+        config,
+        mcu_tmc,
+        current_helper,
+        temp_from_adc=None,
+        init_callback=None,
+    ):
         self.printer = config.get_printer()
         self.stepper_name = " ".join(config.get_name().split()[1:])
         self.name = config.get_name().split()[-1]
         self.mcu_tmc = mcu_tmc
         self.current_helper = current_helper
+        self.init_callback = init_callback
         self.fields = mcu_tmc.get_fields()
         self.stepper = None
         # Stepper phase tracking
@@ -384,7 +417,7 @@ class TMCCommandHelper:
         # DUMP_TMC support
         self.read_registers = self.read_translate = None
         # Common tmc helpers
-        self.echeck_helper = TMCErrorCheck(config, mcu_tmc)
+        self.echeck_helper = TMCErrorCheck(config, mcu_tmc, temp_from_adc)
         self.record_helper = TMCStallguardDump(config, mcu_tmc)
         # Set microstep config options
         TMCMicrostepHelper(config, mcu_tmc)
@@ -426,6 +459,8 @@ class TMCCommandHelper:
         )
 
     def _init_registers(self, print_time=None):
+        if self.init_callback is not None:
+            self.init_callback()
         # Send registers
         for reg_name in list(self.fields.registers.keys()):
             val = self.fields.registers[reg_name]  # Val may change during loop
@@ -522,6 +557,9 @@ class TMCCommandHelper:
     # Stepper phase tracking
     def _get_phases(self):
         return (256 >> self.fields.get_field("mres")) * 4
+
+    def clear_mcu_phase_offset(self):
+        self.mcu_phase_offset = None
 
     def get_phase_offset(self):
         return self.mcu_phase_offset, self._get_phases()

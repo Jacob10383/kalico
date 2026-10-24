@@ -15,9 +15,11 @@
 - [`[virtual_sdcard] with_subdirs`](./Config_Reference.md#virtual_sdcard) enables scanning of subdirectories for .gcode files, for the menu and M20/M23 commands
 - [`[firmware_retraction] z_hop_height`](./Config_Reference.md#firmware_retraction) adds an automatic z hop when using firmware retraction
 - [`[constants]` and `${constants.value}`](./Config_Reference.md#configuration-references) allow re-using values in your configuration
+- [`[include]` variables](./Config_Reference.md#include) let one included file be reused with different values, e.g. one board config for several toolhead MCUs
 
 ## Enhanced behavior
 
+- [`SET_NOZZLE_DIAMETER`](./G-Codes.md#set_nozzle_diameter) changes an extruder's nozzle diameter (and optionally its max extrusion cross section) at runtime, e.g. for toolheads with different nozzles or a high-flow purge line.
 - [`canbus_query.py`](./CANBUS.md#finding-the-canbus_uuid-for-new-micro-controllers) now responds with all Kalico devices, even after they've been assigned a node_id.
 - Input shaper calibration now warns about active fans that may affect measurement accuracy.
 - [`BED_MESH_CHECK`](./G-Codes.md#bed_mesh_check) validates the current bed mesh against specified criteria, allowing you to check maximum deviation and slope between adjacent points before printing.

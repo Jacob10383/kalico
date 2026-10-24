@@ -52,33 +52,6 @@ command to reload the config and restart the host software.
 Printer is halted
 """
 
-message_protocol_error = """MCU Protocol error"""
-
-message_protocol_error1 = """
-This is frequently caused by running an older version of the
-firmware on the MCU(s). Fix by recompiling and flashing the
-firmware.
-"""
-
-message_protocol_error2 = """
-Once the underlying issue is corrected, use the "RESTART"
-command to reload the config and restart the host software.
-"""
-
-message_mcu_connect_error = """
-Once the underlying issue is corrected, use the
-"FIRMWARE_RESTART" command to reset the firmware, reload the
-config, and restart the host software.
-Error configuring printer
-"""
-
-message_shutdown = """
-Once the underlying issue is corrected, use the
-"FIRMWARE_RESTART" command to reset the firmware, reload the
-config, and restart the host software.
-Printer is shutdown
-"""
-
 
 class WaitInterruption(gcode.CommandError):
     pass
@@ -267,6 +240,16 @@ class Printer:
         ):
             self.request_exit("error_exit")
 
+    def update_error_msg(self, oldmsg, newmsg):
+        if (
+            self.state_message != oldmsg
+            or self.state_message in (message_ready, message_startup)
+            or newmsg in (message_ready, message_startup)
+        ):
+            return
+        self.state_message = newmsg
+        logging.error(newmsg)
+
     def add_object(self, name, obj):
         if name in self.objects:
             raise self.config_error(
@@ -358,59 +341,6 @@ class Printer:
         error_on_unused = get_danger_options().error_on_unused_config_options
         pconfig.check_unused_options(config, error_on_unused)
 
-    def _build_protocol_error_message(self, e):
-        host_version = self.start_args["software_version"]
-
-        msg_update = []
-        msg_updated = []
-
-        for mcu_name, mcu_obj in self.lookup_objects("mcu"):
-            try:
-                mcu_version = mcu_obj.get_status()["mcu_version"]
-            except:
-                logging.exception("Unable to retrieve mcu_version from mcu_obj")
-                continue
-
-            if mcu_version != host_version:
-                msg_update.append(
-                    "%s: Current version %s"
-                    % (
-                        mcu_name.split()[-1],
-                        mcu_obj.get_status()["mcu_version"],
-                    )
-                )
-            else:
-                msg_updated.append(
-                    "%s: Current version %s"
-                    % (
-                        mcu_name.split()[-1],
-                        mcu_obj.get_status()["mcu_version"],
-                    )
-                )
-
-        if not len(msg_updated):
-            msg_updated.append("<none>")
-
-        version_msg = [
-            "\nYour Kalico version is: %s\n" % host_version,
-            "MCU(s) which should be updated:",
-            "\n%s\n" % "\n".join(msg_update),
-            "Up-to-date MCU(s):",
-            "\n%s\n" % "\n".join(msg_updated),
-        ]
-
-        msg = [
-            message_protocol_error,
-            "",
-            " ".join(message_protocol_error1.splitlines())[1:],
-            "\n".join(version_msg),
-            " ".join(message_protocol_error2.splitlines())[1:],
-            "",
-            str(e),
-        ]
-
-        return "\n".join(msg)
-
     def _connect(self, eventtime):
         try:
             self._read_config()
@@ -424,13 +354,17 @@ class Printer:
             self._set_state("%s\n%s" % (str(e), message_restart))
             return
         except msgproto.error as e:
-            logging.exception("Protocol error")
-            self._set_state(self._build_protocol_error_message(e))
+            msg = "Protocol error"
+            logging.exception(msg)
+            self._set_state(msg)
+            self.send_event("klippy:notify_mcu_error", msg, {"error": str(e)})
             util.dump_mcu_build()
             return
         except mcu.error as e:
-            logging.exception("MCU error during connect")
-            self._set_state("%s%s" % (str(e), message_mcu_connect_error))
+            msg = "MCU error during connect"
+            logging.exception(msg)
+            self._set_state(msg)
+            self.send_event("klippy:notify_mcu_error", msg, {"error": str(e)})
             util.dump_mcu_build()
             return
         except Exception as e:
@@ -445,10 +379,11 @@ class Printer:
             return
         try:
             self._set_state(message_ready)
-            for cb in self.event_handlers.get("klippy:ready", []):
-                if self.state_message is not message_ready:
-                    return
-                cb()
+            with self.reactor.assert_no_pause():
+                for cb in self.event_handlers.get("klippy:ready", []):
+                    if self.state_message is not message_ready:
+                        return
+                    cb()
         except Exception as e:
             logging.exception("Unhandled exception during ready callback")
             self.invoke_shutdown(
@@ -496,24 +431,29 @@ class Printer:
         if self.bglogger is not None:
             self.bglogger.set_rollover_info(name, info)
 
-    def invoke_shutdown(self, msg):
+    def invoke_shutdown(self, msg, details=None):
         if self.in_shutdown_state:
             return
+        if details is None:
+            details = {}
         logging.error("Transition to shutdown state: %s", msg)
         self.in_shutdown_state = True
-        self._set_state("%s%s" % (msg, message_shutdown))
-        for cb in self.event_handlers.get("klippy:shutdown", []):
-            try:
-                cb()
-            except:
-                logging.exception("Exception during shutdown handler")
-        logging.info(
-            "Reactor garbage collection: %s", self.reactor.get_gc_stats()
-        )
+        self._set_state(msg)
+        with self.reactor.assert_no_pause():
+            for cb in self.event_handlers.get("klippy:shutdown", []):
+                try:
+                    cb()
+                except:
+                    logging.exception("Exception during shutdown handler")
+            for cb in self.event_handlers.get("klippy:analyze_shutdown", []):
+                try:
+                    cb(msg, details)
+                except:
+                    logging.exception("Exception in analyze_shutdown handler")
 
-    def invoke_async_shutdown(self, msg):
+    def invoke_async_shutdown(self, msg, details=None):
         self.reactor.register_async_callback(
-            (lambda e: self.invoke_shutdown(msg))
+            (lambda e: self.invoke_shutdown(msg, details))
         )
 
     def register_event_handler(self, event, callback):
