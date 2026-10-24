@@ -546,6 +546,9 @@ class PrinterProbe:
             self.multi_probe_end()
 
     def _handle_command_error(self):
+        # A failed probe leaves its exhausted retry state behind, which
+        # would fail the next probe at the same position without a sample
+        self.retry_session.end()
         try:
             self.multi_probe_end()
         except:
