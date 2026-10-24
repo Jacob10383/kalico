@@ -33,6 +33,16 @@
 #define REG_CRM_MISC3_HICK_TO_USB (1 << 8)
 #define REG_CRM_APB2EN_ACCEN      (1 << 22)
 
+#define REG_GD32_RCU_CFG1_ADDR    (REG_CRM_BASE + 0x2c)
+#define REG_GD32_PMU_CTL_ADDR     (0x40007000)
+#define REG_GD32_PMU_CS_ADDR      (0x40007004)
+#define REG_GD32_APB1EN_PMUREN    (1 << 28)
+#define REG_GD32_PMU_CTL_LDOVS    (0xc000)
+#define REG_GD32_PMU_CTL_HDEN     (1 << 16)
+#define REG_GD32_PMU_CTL_HDS      (1 << 17)
+#define REG_GD32_PMU_CS_HDRF      (1 << 16)
+#define REG_GD32_PMU_CS_HDSRF     (1 << 17)
+#define REG_GD32_PLLMF_30         (0x08340000)
 
 // Map a peripheral address to its enable bits
 struct cline
@@ -68,10 +78,72 @@ gpio_clock_enable(GPIO_TypeDef *regs)
 
 // PLL (f103) input: 1 to 25Mhz, output: 16 to 72Mhz
 
+#if CONFIG_MACH_GD32F303
+static void
+gd32f303_delay(void)
+{
+    for (volatile uint32_t i = 0; i <= 0x4f; i++)
+        ;
+}
+
+static void
+gd32f303_clock_setup(void)
+{
+    volatile uint32_t *rcu_cfg1 = (void *)REG_GD32_RCU_CFG1_ADDR;
+    volatile uint32_t *pmu_ctl = (void *)REG_GD32_PMU_CTL_ADDR;
+    volatile uint32_t *pmu_cs = (void *)REG_GD32_PMU_CS_ADDR;
+
+    RCC->CR |= RCC_CR_HSION;
+    while (!(RCC->CR & RCC_CR_HSIRDY))
+        ;
+
+    RCC->CFGR |= 0x80;
+    gd32f303_delay();
+    RCC->CFGR |= 0x90;
+    gd32f303_delay();
+
+    RCC->CFGR &= ~RCC_CFGR_SW_Msk;
+    RCC->CR &= ~(RCC_CR_CSSON | RCC_CR_PLLON | RCC_CR_HSEON);
+    RCC->CIR = 0x009f0000;
+    RCC->CR &= ~RCC_CR_HSEBYP;
+    RCC->CFGR = 0;
+    *rcu_cfg1 = 0;
+
+    RCC->CR |= RCC_CR_HSEON;
+    while (!(RCC->CR & RCC_CR_HSERDY))
+        ;
+
+    RCC->APB1ENR |= REG_GD32_APB1EN_PMUREN;
+    *pmu_ctl |= REG_GD32_PMU_CTL_LDOVS;
+
+    uint32_t cfgr = (RCC_CFGR_PPRE1_DIV2 | RCC_CFGR_PPRE2_DIV2
+                     | RCC_CFGR_PLLSRC | RCC_CFGR_PLLXTPRE_HSE_DIV2
+                     | REG_GD32_PLLMF_30);
+    RCC->CFGR = cfgr;
+    RCC->CR |= RCC_CR_PLLON;
+    while (!(RCC->CR & RCC_CR_PLLRDY))
+        ;
+
+    *pmu_ctl |= REG_GD32_PMU_CTL_HDEN;
+    while (!(*pmu_cs & REG_GD32_PMU_CS_HDRF))
+        ;
+    *pmu_ctl |= REG_GD32_PMU_CTL_HDS;
+    while (!(*pmu_cs & REG_GD32_PMU_CS_HDSRF))
+        ;
+
+    RCC->CFGR = cfgr | RCC_CFGR_SW_PLL;
+    while ((RCC->CFGR & RCC_CFGR_SWS_Msk) != RCC_CFGR_SWS_PLL)
+        ;
+}
+#endif
+
 // Main clock setup called at chip startup
 static void
 clock_setup(void)
 {
+#if CONFIG_MACH_GD32F303
+    gd32f303_clock_setup();
+#else
     // Configure and enable PLL
     uint32_t cfgr;
     if (!CONFIG_STM32_CLOCK_REF_INTERNAL) {
@@ -122,6 +194,7 @@ clock_setup(void)
     RCC->CFGR = cfgr | RCC_CFGR_SW_PLL;
     while ((RCC->CFGR & RCC_CFGR_SWS_Msk) != RCC_CFGR_SWS_PLL)
         ;
+#endif
 }
 
 
