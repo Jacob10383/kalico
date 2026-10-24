@@ -10,8 +10,8 @@ from typing import Optional, Union
 
 from klippy.mcu import MCU
 
-MAX_INT32 = 2**31
-MIN_INT32 = -(2**31) - 1
+MAX_INT32 = 2**31 - 1
+MIN_INT32 = -(2**31)
 
 
 def assert_is_int32(value: int, error: str) -> int:
