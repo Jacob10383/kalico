@@ -6,6 +6,7 @@ Do not edit directly; re-run the bundler to regenerate.
 """
 from __future__ import annotations
 
+import contextlib
 import functools
 import json
 import logging
@@ -16,8 +17,67 @@ from dataclasses import asdict, dataclass
 from extras import motion_limits, serial_485
 from functools import partial
 from pathlib import Path
-from typing import Iterable
 
+
+# ──────────────────────────────────────────────────────────────────────────
+# motor_address_latch
+# ──────────────────────────────────────────────────────────────────────────
+
+"""K2 main-MCU motor address latch.
+
+The XY/Z motor boards read their RS-485 address from their STEP/DIR inputs
+when the host sends the address broadcast. The main MCU presents those
+levels on the stepper pins and restores them afterwards, keeping its own
+DIR state in sync, so no host-side pin objects share the stepper pins.
+"""
+
+
+
+LATCH_STEPPERS = ("stepper_x", "stepper_y", "stepper_z", "stepper_z1")
+LATCH_FORMAT = (
+    "motor_address_latch action=%c x_oid=%c y_oid=%c z_oid=%c z1_oid=%c")
+
+
+class MotorAddressLatch:
+    def __init__(self, printer):
+        self.printer = printer
+        self._command = None
+        self._oids = None
+
+    def _init_command(self):
+        if self._command is not None:
+            return
+        kin = self.printer.lookup_object("toolhead").get_kinematics()
+        steppers = {s.get_name(): s for s in kin.get_steppers()}
+        missing = [name for name in LATCH_STEPPERS if name not in steppers]
+        if missing:
+            raise RuntimeError(
+                "motor address latch requires %s" % (", ".join(missing),))
+        selected = [steppers[name] for name in LATCH_STEPPERS]
+        mcu = selected[0].get_mcu()
+        if any(s.get_mcu() is not mcu for s in selected):
+            raise RuntimeError(
+                "motor address latch requires the XY/Z steppers on one MCU")
+        self._command = mcu.lookup_command(LATCH_FORMAT)
+        self._oids = [s.get_oid() for s in selected]
+
+    @contextlib.contextmanager
+    def latched(self):
+        """Present the address levels for the duration of the block.
+
+        Holds the G-Code mutex and waits for motion to finish first, so no
+        move runs while the stepper pins carry the address.
+        """
+        self._init_command()
+        gcode = self.printer.lookup_object("gcode")
+        toolhead = self.printer.lookup_object("toolhead")
+        with gcode.get_mutex():
+            toolhead.wait_moves()
+            try:
+                self._command.send_wait_ack([0, *self._oids])
+                yield
+            finally:
+                self._command.send_wait_ack([1, *self._oids])
 
 # ──────────────────────────────────────────────────────────────────────────
 # motor_cut_calibration
@@ -1435,25 +1495,42 @@ class MotorParamExecutor:
 
 """Transport adapter for extruder motor packets over nozzle MCU transparent I/O.
 
-Registers the transparent command pair on `nozzle_mcu` and exposes a `send()`
+Configures the K2 nozzle MCU's USART3 forwarding and exposes a `send()`
 method for full motor firmware packets.
+
+The nozzle MCU drops an outgoing message when its transmit buffer is full,
+which the load cell stream makes likely. It keeps the last reply, so a
+missing reply is requested again with `transparent_query` instead of
+sending the motor packet a second time.
 """
 
 
 
 
 class NozzleTransparentTransportAdapter:
-    QUERY_FORMAT = "transparent_send oid=%c write=%*s timeout_ms=%u"
-    RESPONSE_FORMAT = "transparent_response oid=%c read=%*s"
+    SEND_FORMAT = "transparent_send oid=%c seq=%c write=%*s timeout_ms=%u"
+    QUERY_FORMAT = "transparent_query oid=%c seq=%c"
+    RESPONSE_NAME = "transparent_response"
+    RX_PIN = "nozzle_mcu:PB11"
+    TX_PIN = "nozzle_mcu:PB10"
     HOST_RESPONSE_GRACE = 0.250
     HOST_RESPONSE_MIN = 0.500
+    # Wait for a re-requested reply; it is already held by the MCU
+    REPLY_QUERY_TIMEOUT = 0.100
+    REPLY_QUERIES = 3
 
     def __init__(self, nozzle_mcu):
         self.nozzle_mcu = nozzle_mcu
+        printer = nozzle_mcu.get_printer()
         self.oid = int(self.nozzle_mcu.create_oid())
+        self._mutex = printer.get_reactor().mutex()
+        self._seq = 0
         self._cmd_queue = None
         self._send_cmd = None
-        self._send_busy = False
+        self._query_cmd = None
+        # Reserve the USART3 pins so a conflicting use is a config error
+        ppins = printer.lookup_object("pins")
+        self._pins = [ppins.lookup_pin(pin) for pin in (self.RX_PIN, self.TX_PIN)]
         self.nozzle_mcu.register_config_callback(self._build_config)
 
     @classmethod
@@ -1463,18 +1540,13 @@ class NozzleTransparentTransportAdapter:
     def _build_config(self):
         if self._cmd_queue is None:
             self._cmd_queue = self.nozzle_mcu.alloc_command_queue()
-        self.nozzle_mcu.add_config_cmd("config_transparent oid=%d" % (self.oid,))
+        self.nozzle_mcu.add_config_cmd(
+            "config_transparent oid=%d rx_pin=%s tx_pin=%s"
+            % (self.oid, self._pins[0]["pin"], self._pins[1]["pin"]))
         self._send_cmd = self.nozzle_mcu.lookup_command(
-            self.QUERY_FORMAT,
-            cq=self._cmd_queue,
-        )
-
-    def get_send_cmd(self):
-        if self._send_cmd is None:
-            raise RuntimeError(
-                "transparent_send command is not configured yet; "
-                "wait for nozzle_mcu config callbacks to complete")
-        return self._send_cmd
+            self.SEND_FORMAT, cq=self._cmd_queue)
+        self._query_cmd = self.nozzle_mcu.lookup_command(
+            self.QUERY_FORMAT, cq=self._cmd_queue)
 
     def is_configured(self) -> bool:
         return bool(self._send_cmd is not None)
@@ -1488,34 +1560,6 @@ class NozzleTransparentTransportAdapter:
             float(timeout) + cls.HOST_RESPONSE_GRACE,
             cls.HOST_RESPONSE_MIN)
 
-    def _wait_for_response(self, cmd: bytes, response_timeout: float):
-        reactor = self.nozzle_mcu.get_printer().get_reactor()
-        serial = self.nozzle_mcu._serial
-        completion = reactor.completion()
-        min_query_time = reactor.monotonic()
-        response_name = self.RESPONSE_FORMAT.split()[0]
-
-        def handle_callback(params):
-            nonlocal min_query_time
-            if params["#sent_time"] >= min_query_time:
-                min_query_time = reactor.NEVER
-                reactor.async_complete(completion, params)
-
-        self.nozzle_mcu.register_response(handle_callback, response_name, self.oid)
-        try:
-            serial.raw_send_wait_ack(cmd, 0, 0, self._cmd_queue)
-            deadline = reactor.monotonic() + float(response_timeout)
-            query_time = reactor.monotonic()
-            while True:
-                params = completion.wait(min(query_time + 0.500, deadline))
-                if params is not None:
-                    return params
-                query_time = reactor.monotonic()
-                if query_time >= deadline:
-                    return None
-        finally:
-            self.nozzle_mcu.register_response(None, response_name, self.oid)
-
     @staticmethod
     def _coerce_attempts(attempts: int) -> int:
         attempts = int(attempts)
@@ -1523,25 +1567,42 @@ class NozzleTransparentTransportAdapter:
             raise ValueError("transparent transport attempts must be >= 1")
         return attempts
 
-    def _send_once(
-            self, packet: bytes, timeout: float,
-            response_timeout: float) -> bytes | None:
+    def _exchange(self, packet: bytes, timeout: float,
+                  response_timeout: float):
+        """Send one packet; return the reply params or None."""
+        if self._send_cmd is None:
+            raise RuntimeError(
+                "transparent_send command is not configured yet; "
+                "wait for nozzle_mcu config callbacks to complete")
+        reactor = self.nozzle_mcu.get_printer().get_reactor()
+        serial = self.nozzle_mcu._serial
+        self._seq = (self._seq + 1) & 0xff
+        seq = self._seq
+        completion = reactor.completion()
+
+        def handle_callback(params):
+            if params["seq"] == seq and not completion.test():
+                reactor.async_complete(completion, params)
+
         timeout_ms = max(1, int(float(timeout) * 1000.0))
-        params = self._wait_for_response(
-            self.get_send_cmd()._cmd.encode(
-                [self.oid, bytes(packet), timeout_ms]),
-            response_timeout,
-        )
-        if params is None:
+        cmds = [self._send_cmd._cmd.encode(
+            [self.oid, seq, bytes(packet), timeout_ms])]
+        cmds += [self._query_cmd._cmd.encode([self.oid, seq])
+                 ] * self.REPLY_QUERIES
+        waits = [response_timeout] + [self.REPLY_QUERY_TIMEOUT
+                                      ] * self.REPLY_QUERIES
+        self.nozzle_mcu.register_response(
+            handle_callback, self.RESPONSE_NAME, self.oid)
+        try:
+            for cmd, wait in zip(cmds, waits):
+                serial.raw_send_wait_ack(cmd, 0, 0, self._cmd_queue)
+                params = completion.wait(reactor.monotonic() + wait)
+                if params is not None:
+                    return params
             return None
-        payload = params["read"]
-        if isinstance(payload, bytes):
-            return payload
-        if isinstance(payload, bytearray):
-            return bytes(payload)
-        raise RuntimeError(
-            "unexpected transparent response payload type: %s"
-            % (payload.__class__.__name__,))
+        finally:
+            self.nozzle_mcu.register_response(
+                None, self.RESPONSE_NAME, self.oid)
 
     def send(self, packet: bytes,
              timeout: float = MOTOR_COMMAND_TIMEOUT, attempts: int = 1,
@@ -1550,17 +1611,13 @@ class NozzleTransparentTransportAdapter:
             raise TypeError("transparent packet must be bytes-like")
         attempts = self._coerce_attempts(attempts)
         host_timeout = self._host_response_timeout(timeout, response_timeout)
-        if self._send_busy:
-            raise RuntimeError("transparent transport send already in progress")
-        self._send_busy = True
-        try:
+        # One transfer at a time; other callers wait their turn
+        with self._mutex:
             for _attempt in range(attempts):
-                response = self._send_once(packet, timeout, host_timeout)
-                if response is not None:
-                    return response
+                params = self._exchange(packet, timeout, host_timeout)
+                if params is not None:
+                    return bytes(params["read"])
             return None
-        finally:
-            self._send_busy = False
 
 # ──────────────────────────────────────────────────────────────────────────
 # serial485_transport
@@ -2477,94 +2534,6 @@ class Mot2TempSensorHub:
         return self.reactor.monotonic() + POLL_INTERVAL
 
 # ──────────────────────────────────────────────────────────────────────────
-# motor_pin_manager
-# ──────────────────────────────────────────────────────────────────────────
-
-"""Mainboard motor pin-state manager.
-
-Drives STEP/DIR address straps for the stock Creality MCU during discovery.
-"""
-
-
-
-
-
-# Physical levels. Each driver latches its RS-485 address from them:
-# addr = 0x81 + DIR + 2 * STEP. Pins also start at these levels.
-PIN_DIR_SEQUENCE = (
-    ("motor_y_dir", 0),
-    ("motor_y_step", 0),
-    ("motor_x_dir", 1),
-    ("motor_x_step", 0),
-    ("motor_z_dir", 0),
-    ("motor_z_step", 1),
-    ("motor_z1_dir", 1),
-    ("motor_z1_step", 1),
-)
-
-PIN_NORMAL_SEQUENCE = tuple((option, 0) for option, _level in PIN_DIR_SEQUENCE)
-
-
-def _shareable_pin_desc(pin_desc: str) -> str:
-    desc = pin_desc.strip()
-    while desc and desc[0] in "!^~":
-        desc = desc[1:].strip()
-    return desc
-
-
-class MotorPinManager:
-    def __init__(self, printer, config_model: MotorControlConfigModel):
-        self.printer = printer
-        self.config_model = config_model
-        self.reactor = printer.get_reactor()
-        self.mcu = printer.lookup_object("mcu")
-        self.ppins = printer.lookup_object("pins")
-        self.outputs = {}
-        self._inverted = {}
-        self._init_outputs()
-
-    def _init_outputs(self):
-        for option in OUTPUT_PIN_OPTIONS:
-            pin_cfg = self.config_model.pins.get(option)
-            if pin_cfg is None:
-                raise RuntimeError(f"missing required output pin config for {option}")
-            self.ppins.allow_multi_use_pin(_shareable_pin_desc(pin_cfg.pin_desc))
-            pin = self.ppins.setup_pin("digital_out", pin_cfg.pin_desc)
-            # Klipper writes logical values; undo the [stepper_*] pin's "!".
-            inverted = self.ppins.parse_pin(
-                pin_cfg.pin_desc, can_invert=True)["invert"]
-            initial = dict(PIN_DIR_SEQUENCE)[option] ^ inverted
-            pin.setup_max_duration(0.0)
-            pin.setup_start_value(initial, initial)
-            self.outputs[option] = pin
-            self._inverted[option] = inverted
-
-    def _schedule_sequence(
-            self, sequence: Iterable[tuple[str, int]]):
-        start = (
-            self.mcu.estimated_print_time(self.reactor.monotonic())
-            + 0.05)
-        for idx, (attr, level) in enumerate(sequence):
-            pin = self.outputs[attr]
-            when = start + idx * 0.003
-            pin.set_digital(when, level ^ self._inverted[attr])
-        # set_digital queues future writes. Do not broadcast the address-latch
-        # request (or leave cleanup) before the final write's scheduled time.
-        deadline = when + 0.010
-        while True:
-            now = self.reactor.monotonic()
-            remaining = deadline - self.mcu.estimated_print_time(now)
-            if remaining <= 0.0:
-                break
-            self.reactor.pause(now + remaining)
-
-    def set_motor_pin_dir(self):
-        return self._schedule_sequence(PIN_DIR_SEQUENCE)
-
-    def set_motor_pin_normal(self):
-        return self._schedule_sequence(PIN_NORMAL_SEQUENCE)
-
-# ──────────────────────────────────────────────────────────────────────────
 # motor_control
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -2572,7 +2541,7 @@ class MotorPinManager:
 
 Architecture:
 - config model: `MotorControlConfigModel`
-- host-side address pin orchestration: `MotorPinManager`
+- motor address assignment: `MotorAddressLatch` (main MCU)
 - RS485 transport: `Serial485TransportAdapter`
 - firmware axis routing: `MotorAxisController`
 """
@@ -2650,7 +2619,7 @@ class MotorControl(MotorControlDebugSurfaceMixin):
             self.registry,
             serial_transport=self.transport,
             extruder_transport=self.extruder_transport)
-        self.pin_manager = MotorPinManager(self.printer, self.config_model)
+        self.address_latch = MotorAddressLatch(self.printer)
         self.stall_monitor = MotorStallMonitor(
             config, replacement=self, config_model=self.config_model)
         self.cut_calibration = MotorCutCalibrationHelper(self)
@@ -3260,12 +3229,9 @@ class MotorControl(MotorControlDebugSurfaceMixin):
         )
 
     def _startup_discover_serial_targets(self):
-        try:
-            self.pin_manager.set_motor_pin_dir()
+        with self.address_latch.latched():
             prepared = self.axes.prepare_serial_bus()
             result = self.axes.probe_serial_axes(timeout=MOTOR_COMMAND_TIMEOUT)
-        finally:
-            self.pin_manager.set_motor_pin_normal()
         faulted = sorted(
             addr for addr, detail in result.items() if detail.get("faulted"))
         warned = sorted(

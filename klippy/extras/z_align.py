@@ -7,23 +7,32 @@
 # Z homing. XY homing can run while the MCU alignment is active; the post-align
 # bed rise is a normal homing move.
 #
-# Example config with current Python defaults:
+# Each Z motor drops onto its own bottom switch, which levels the bed. Both
+# sides then back off together and re-approach slowly twice; how far a side
+# misses its trigger point is that switch's repeatability, which sets how
+# accurately a power-loss resume finds Z again.
+#
+# Options and their defaults; the K2 config only sets the rise:
 # [z_align]
-# quick_speed: 30  # mm/s for the MCU-side fast drop into the switches.
-# slow_speed: 10  # mm/s for the MCU-side slow settle pass.
-# rising_dist: 10  # mm lift between the fast and slow MCU passes.
-# safe_dist: 40  # mm max extra one-sided drop after the other switch triggers.
-# filter_cnt: 10  # Consecutive switch samples required before accepting a trigger.
-# timeout: 30  # Seconds allowed for a single MCU z_align attempt.
-# retries: 5  # Max MCU retry attempts before aborting.
-# retry_tolerance: 10  # Allowed left/right mismatch in MCU-reported steps.
-# endstop_pin_z: PA15, PA8  # Bottom photoelectric switch pins, one per Z motor.
-# zd_up: 0  # Direction level that moves Z away from the switches.
-# zes_untrig: 1  # Logic level reported by an untriggered switch.
-# rise_distance: 340  # mm rise after switch alignment before final Z home.
-# rise_speed: 50  # mm/s for that long post-align rise.
-# temp_rise_max_z_accel: 200  # Temporary accel cap for the post-align rise.
-# zmax: 350  # Logical Z coordinate after MCU bottom-switch alignment.
+# quick_speed: 30  # mm/s, first drop onto the switches.
+# slow_speed: 10  # mm/s, the re-approaches and every lift.
+# retract_dist: 2  # mm both sides lift before each re-approach; must be
+#                  # more than the switch hysteresis.
+# safe_dist: 40  # mm one side may keep dropping after the other side's
+#                # switch triggered (a bed that tilted at power off).
+# repeat_tolerance: 0.01  # mm a side may miss its trigger point before
+#                         # the alignment is redone.
+# repeat_max: 0.5  # mm miss still accepted, with a warning, once the
+#                  # retries are used up.
+# retries: 2  # Re-runs when a side misses by more than repeat_tolerance.
+# endstop_pin_z: PA15, PA8  # Bottom switch pins, one per Z motor.
+# zes_untrig: 1  # Level an untriggered switch reads.
+# rise_distance: 340  # mm rise after alignment before the final Z home.
+# rise_speed: 50  # mm/s for that rise.
+# temp_rise_max_z_accel: 200  # Temporary accel cap for that rise.
+# zmax: 350  # Logical Z of the bed sitting on the switches.
+#
+# The direction toward the switches comes from each stepper's dir_pin.
 #
 import json
 import logging
@@ -42,10 +51,34 @@ def _klog(msg, *args, level=logging.info):
 POLL_INTERVAL = 0.010
 TEMP_RISE_MAX_Z_VELOCITY = 100.0
 TEMP_RISE_MAX_Z_ACCEL = 200.0
-STARTUP_RISE_PRIME_MAX_DIST = 0.1
-STARTUP_RISE_PRIME_SPEED = 10.0
 TILT_BIAS_FILE = '/mnt/UDISK/printer_data/z_align_tilt_bias.json'
 MAX_TILT_BIAS = 1.0
+LIFT_MAX_DIST = 15.0  # mm lift allowed for a triggered switch to release
+FAST_MAX_MARGIN = 20.0  # mm fast drop allowed beyond the Z range
+FILTER_COUNT = 10  # Consecutive switch samples, one per halfstep
+MCU_PASSES = 2  # Re-approaches per alignment
+SETTLE_TIME = 0.150  # s at rest after each stop, before the next move
+# Options of the earlier alignment, accepted so older configs load
+_IGNORED_OPTIONS = (
+    'zd_up', 'rise_max_dist', 'rise_clearance', 'fast_max_dist',
+    'filter_cnt', 'timeout', 'retry_tolerance', 'rising_dist',
+)
+MCU_Z_ALIGN_ERROR_REASONS = {
+    1: 'invalid MCU z-align configuration',
+    2: 'a bottom switch did not release after lifting',
+    3: 'a bottom switch did not trigger within the Z range',
+    4: 'one Z side dropped more than safe_dist after the other side stopped',
+    5: 'a bottom switch did not trigger again on a re-approach',
+    6: 'MCU z-align was force-stopped',
+}
+MCU_Z_ALIGN_PHASES = {1: 'clear', 2: 'fast', 3: 'retract', 4: 'slow'}
+QUERY_FORMAT = (
+    "query_z_align oid=%c quick_ticks=%u slow_ticks=%u retract=%u"
+    " safe=%u fast_max=%u lift_max=%u filter=%c settle_ticks=%u")
+STATUS_FORMAT = (
+    "z_align_status oid=%c flag=%c error=%c phase=%c start=%c end=%c"
+    " lift=%u fast0=%u fast1=%u released0=%u released1=%u"
+    " slow0_0=%u slow0_1=%u slow1_0=%u slow1_1=%u")
 
 
 class ZAlignNullEndstop:
@@ -74,20 +107,34 @@ class ZAlign:
         self.reactor = self.printer.get_reactor()
         self.gcode = self.printer.lookup_object('gcode')
         self.endstop_pin_z = config.getlist('endstop_pin_z', ('PA15', 'PA8'))
-        self.zd_up = config.getint('zd_up', 0)
         self.zes_untrig = config.getint('zes_untrig', 1)
+        for option in _IGNORED_OPTIONS:
+            config.get(option, None)
         self.fast_drop_speed = config.getfloat('quick_speed', 30.0, above=0.0)
         self.settle_drop_speed = config.getfloat('slow_speed', 10.0, above=0.0)
-        self.mcu_rising_dist = config.getfloat('rising_dist', 10.0, above=0.0)
-        self.mcu_filter_count = config.getint('filter_cnt', 10, minval=1)
-        self.retries = config.getint('retries', 5, minval=1)
-        self.retry_tolerance = config.getint('retry_tolerance', 10, minval=0)
+        self.retract_dist = config.getfloat('retract_dist', 2.0, above=0.0)
+        self.safe_dist = config.getfloat('safe_dist', 40.0, above=0.0)
+        self.repeat_tolerance = config.getfloat(
+            'repeat_tolerance', 0.01, above=0.0)
+        self.repeat_max = config.getfloat(
+            'repeat_max', 0.5, minval=self.repeat_tolerance)
+        self.retries = config.getint('retries', 2, minval=0)
         self.rise_distance = config.getfloat('rise_distance', 340.0, above=0.0)
         self.rise_speed = config.getfloat('rise_speed', 50.0, above=0.0)
         self.temp_rise_max_z_accel = config.getfloat(
             'temp_rise_max_z_accel', TEMP_RISE_MAX_Z_ACCEL, above=0.0)
-        self.safe_dist = config.getfloat('safe_dist', 40.0, above=0.0)
-        self.timeout = config.getfloat('timeout', 30.0, above=0.0)
+        zconfig = config.getsection('stepper_z')
+        z_range = (
+            zconfig.getfloat('position_max', 360.0, note_valid=False)
+            - zconfig.getfloat('position_min', 0.0, note_valid=False))
+        self.fast_max_dist = z_range + FAST_MAX_MARGIN
+        # The fast drop, then the clear lift and every pass at slow speed
+        slow_dist = LIFT_MAX_DIST + self.retract_dist * (1 + 3 * MCU_PASSES)
+        settles = 2 + 2 * MCU_PASSES
+        self.timeout = 1.5 * (
+            self.fast_max_dist / self.fast_drop_speed
+            + slow_dist / self.settle_drop_speed
+            + settles * SETTLE_TIME) + 5.0
         self.zmax = config.getfloat('zmax', 350.0, above=0.0)
         self._toolhead = None
         self._z_align_query_cmd = None
@@ -105,8 +152,8 @@ class ZAlign:
         self._target_z = None
         self._logical_z_applied = False
         self._settle_attempt = 0
-        self._last_retry_delta_mm = 0.0
-        self._last_retry_delta_steps = 0
+        self._last_tilt_mm = 0.0
+        self._last_repeat_mm = [0.0, 0.0]
         self._z_tilt = None
         self._tilt_bias = 0.0
         self._learn_delta = None
@@ -134,8 +181,10 @@ class ZAlign:
             section = self.config.getsection(section_name)
             step_pin = section.get('step_pin')
             dir_pin = section.get('dir_pin')
-            if dir_pin.startswith('!'):
-                dir_pin = dir_pin[1:]
+            # Away from the switches is toward Z min, which the host drives
+            # with the DIR level equal to the pin's inversion
+            zd_up = 1 if dir_pin.startswith('!') else 0
+            dir_pin = dir_pin.lstrip('!')
             config_z_align_add = (
                 "config_z_align_add oid=%d z_indx=%d zs_pin=%s zd_pin=%s "
                 "zd_up=%d zes_pin=%s zes_untrig=%d"
@@ -144,7 +193,7 @@ class ZAlign:
                     stepper_index,
                     step_pin,
                     dir_pin,
-                    self.zd_up,
+                    zd_up,
                     endstop_pin,
                     self.zes_untrig,
                 ))
@@ -152,7 +201,7 @@ class ZAlign:
             _klog(
                 "config_z_align_add oid=%d z_indx=%d zs_pin=%s "
                 "zd_pin=%s zd_up=%d zes_pin=%s zes_untrig=%d",
-                self._oidz, stepper_index, step_pin, dir_pin, self.zd_up,
+                self._oidz, stepper_index, step_pin, dir_pin, zd_up,
                 endstop_pin, self.zes_untrig)
 
     def get_switch_states(self, state):
@@ -165,10 +214,7 @@ class ZAlign:
         self._toolhead = self.printer.lookup_object('toolhead')
         self._install_status_cache_hook()
         self._z_align_query_cmd = self._main_mcu.lookup_query_command(
-            "query_z_align oid=%c enable=%c quickSpeed=%u slowSpeed=%u"
-            " risingDist=%u filterCnt=%c safeDist=%u",
-            "z_align_status oid=%c flag=%i deltaError1=%i",
-            oid=self._oidz)
+            QUERY_FORMAT, STATUS_FORMAT, oid=self._oidz)
         self._z_align_force_stop_cmd = self._main_mcu.lookup_command(
             "z_align_force_stop oid=%c", cq=None)
         steppers = {
@@ -308,8 +354,8 @@ class ZAlign:
         self._target_z = None
         self._logical_z_applied = False
         self._settle_attempt = 0
-        self._last_retry_delta_mm = 0.0
-        self._last_retry_delta_steps = 0
+        self._last_tilt_mm = 0.0
+        self._last_repeat_mm = [0.0, 0.0]
         self._z_align_status = {}
 
     def _say(self, msg):
@@ -377,6 +423,10 @@ class ZAlign:
         mcu_freq = self._main_mcu._serial.msgparser.get_constant_float('CLOCK_FREQ')
         return max(1, int((self._step_distance / speed) * mcu_freq / 2.0))
 
+    def _calc_time_ticks(self, seconds):
+        mcu_freq = self._main_mcu._serial.msgparser.get_constant_float('CLOCK_FREQ')
+        return max(1, int(seconds * mcu_freq))
+
     def _calc_distance_steps(self, distance):
         return max(1, int(distance / self._step_distance) * 2)
 
@@ -416,23 +466,60 @@ class ZAlign:
                 'failed to force stop MCU z_align',
                 level=logging.exception)
 
-    def _consume_startup_rise_prime(self):
-        homing = self.printer.lookup_object('homing')
-        return bool(homing.consume_z_align_rise_startup_prime())
-
     def _start_mcu_z_align_attempt(self):
-        quick_ticks = self._calc_speed_ticks(self.fast_drop_speed)
-        slow_ticks = self._calc_speed_ticks(self.settle_drop_speed)
-        rising_steps = self._calc_distance_steps(self.mcu_rising_dist)
-        safe_steps = self._calc_distance_steps(self.safe_dist)
         if not self._settle_attempt:
             self._settle_attempt = 1
         self._z_align_status = {}
-        self._z_align_query_cmd.send([
-            self._oidz, 1, quick_ticks, slow_ticks,
-            rising_steps, self.mcu_filter_count, safe_steps])
+        params = self._z_align_query_cmd.send([
+            self._oidz,
+            self._calc_speed_ticks(self.fast_drop_speed),
+            self._calc_speed_ticks(self.settle_drop_speed),
+            self._calc_distance_steps(self.retract_dist),
+            self._calc_distance_steps(self.safe_dist),
+            self._calc_distance_steps(self.fast_max_dist),
+            self._calc_distance_steps(LIFT_MAX_DIST),
+            FILTER_COUNT,
+            self._calc_time_ticks(SETTLE_TIME)])
+        # A rejected start is answered with its final status
+        if params and int(params.get('flag', 0) or 0):
+            self._z_align_status = dict(params)
         self._phase_deadline = self.reactor.monotonic() + self.timeout
         self._state = 'mcu_wait'
+
+    def _alignment_result(self, status):
+        """Corrected tilt and each side's miss on the two re-approaches."""
+        step = self._step_distance or 0.0
+        expected = self._calc_distance_steps(self.retract_dist) // 2
+
+        def steps(key):
+            return int(status.get(key, 0) or 0)
+
+        tilt = (steps('fast0') - steps('fast1')) * step
+        misses = [
+            [abs(steps('slow%d_%d' % (p, side)) - expected) * step
+             for side in (0, 1)]
+            for p in range(MCU_PASSES)]
+        return tilt, misses
+
+    def _mcu_z_align_trace(self, status):
+        step = self._step_distance or 0.0
+
+        def steps(key):
+            return int(status.get(key, 0) or 0)
+
+        phase = MCU_Z_ALIGN_PHASES.get(steps('phase'), 'start')
+        return (
+            'flag=%d error=%d phase=%s states=0x%x->0x%x lift=%.4fmm'
+            ' fast=[%.4f,%.4f]mm released=[%.4f,%.4f]mm'
+            ' slow=[%d,%d],[%d,%d] expected %d steps'
+            % (steps('flag'), steps('error'), phase, steps('start'),
+               steps('end'), steps('lift') * step / 2.0,
+               steps('fast0') * step, steps('fast1') * step,
+               steps('released0') * step / 2.0,
+               steps('released1') * step / 2.0,
+               steps('slow0_0'), steps('slow0_1'),
+               steps('slow1_0'), steps('slow1_1'),
+               self._calc_distance_steps(self.retract_dist) // 2))
 
     def _poll_mcu_z_align(self, eventtime):
         if self._phase_deadline is not None and eventtime > self._phase_deadline:
@@ -446,53 +533,53 @@ class ZAlign:
         flag = int(status.get('flag', 0) or 0)
         if flag == 0:
             return eventtime + POLL_INTERVAL
-        _klog('MCU z-align attempt %d/%d status=%s',
-              self._settle_attempt, self.retries, status)
-        if flag == 2:
+        attempts = self.retries + 1
+        _klog('MCU z-align attempt %d/%d: %s',
+              self._settle_attempt, attempts,
+              self._mcu_z_align_trace(status))
+        if flag != 1:
+            # Mechanical or safety failures; a retry would repeat them
+            reason = MCU_Z_ALIGN_ERROR_REASONS.get(
+                int(status.get('error', 0) or 0),
+                'MCU z-align reported an error')
             self._force_stop_mcu_z_align()
-            if self._settle_attempt >= self.retries:
-                self._fail(
-                    'MCU z_align reported photoelectric error'
-                    ' after %d/%d attempts'
-                    % (self._settle_attempt, self.retries),
-                    request_homing_abort=True)
-                return self.reactor.NEVER
-            self._say(
-                'mcu z_align reported photoelectric error; retrying attempt %d/%d'
-                % (self._settle_attempt + 1, self.retries))
+            self._fail('MCU z-align: %s' % (reason,),
+                       request_homing_abort=True)
+            return self.reactor.NEVER
+        tilt, misses = self._alignment_result(status)
+        repeat = misses[-1]
+        worst = max(repeat)
+        self._last_tilt_mm = tilt
+        self._last_repeat_mm = list(repeat)
+        if worst > self.repeat_tolerance and self._settle_attempt < attempts:
             self._settle_attempt += 1
+            self._say(
+                'alignment repeatability %.4fmm is over %.4fmm;'
+                ' retrying (attempt %d/%d)'
+                % (worst, self.repeat_tolerance, self._settle_attempt,
+                   attempts))
             self._phase_deadline = None
             self._state = 'mcu_start'
             return self.reactor.NOW
-        delta_steps = int(status.get('deltaError1', 0) or 0)
-        delta_mm = delta_steps * (self._step_distance or 0.0)
-        self._last_retry_delta_steps = delta_steps
-        self._last_retry_delta_mm = delta_mm
-        tolerance_mm = self.retry_tolerance * (self._step_distance or 0.0)
-        if abs(delta_steps) <= self.retry_tolerance:
-            self._say(
-                'MCU z-align attempt %d/%d: delta %.4fmm'
-                % (self._settle_attempt, self.retries, delta_mm))
-            self._phase_deadline = None
-            self._prepared_zmax = self.zmax
-            self._target_z = max(0.0, self._prepared_zmax - self.rise_distance)
-            self._state = 'prepared'
-            return self.reactor.NEVER
-        if self._settle_attempt >= self.retries:
+        if worst > self.repeat_max:
             self._fail(
-                'MCU z-align delta %.4fmm exceeded tolerance %.4fmm'
-                ' after %d/%d attempts'
-                % (delta_mm, tolerance_mm, self._settle_attempt, self.retries),
+                'MCU z-align repeatability %.4fmm is over repeat_max %.4fmm'
+                ' after %d attempts'
+                % (worst, self.repeat_max, self._settle_attempt),
                 request_homing_abort=True)
             return self.reactor.NEVER
-        self._settle_attempt += 1
-        self._say(
-            'MCU z-align attempt %d/%d: delta %.4fmm exceeds tolerance %.4fmm;'
-            ' retrying attempt %d/%d'
-            % (self._settle_attempt - 1, self.retries,
-               delta_mm, tolerance_mm, self._settle_attempt, self.retries))
-        self._state = 'mcu_start'
-        return self.reactor.NOW
+        msg = ('tilt corrected %.2fmm, repeatability Z %.4f / Z1 %.4f mm'
+               % (abs(tilt), repeat[0], repeat[1]))
+        if worst > self.repeat_tolerance:
+            msg += ('; over %.4fmm after %d attempts, so a power-loss'
+                    ' resume may be less accurate'
+                    % (self.repeat_tolerance, self._settle_attempt))
+        self._say(msg)
+        self._phase_deadline = None
+        self._prepared_zmax = self.zmax
+        self._target_z = max(0.0, self._prepared_zmax - self.rise_distance)
+        self._state = 'prepared'
+        return self.reactor.NEVER
 
     def _get_z_home_endstops(self):
         kin = self._toolhead.get_kinematics()
@@ -583,8 +670,8 @@ class ZAlign:
                 return {
                     'prepared_zmax': self._prepared_zmax,
                     'target_z': self._target_z,
-                    'delta_steps': self._last_retry_delta_steps,
-                    'delta_mm': self._last_retry_delta_mm,
+                    'tilt_mm': self._last_tilt_mm,
+                    'repeatability_mm': list(self._last_repeat_mm),
                     'skipped': False,
                     'z_known': self._is_toolhead_z_homed(),
                 }
@@ -693,7 +780,6 @@ class ZAlign:
                 or target_z < z_min
                 or target_z > min(zmax, z_limit - margin)):
             raise self.printer.command_error('Invalid targeted Z rise')
-        run_startup_prime = self._consume_startup_rise_prime()
         z_limit_snapshot = None
         try:
             self._state = 'blocking_rise'
@@ -710,24 +796,6 @@ class ZAlign:
             pos = list(self._toolhead.get_position())
             self._logical_z_applied = True
             self._target_z = target_z
-            if run_startup_prime:
-                prime_dist = min(
-                    STARTUP_RISE_PRIME_MAX_DIST,
-                    max(0.1, self.mcu_rising_dist * 0.5))
-                prime_start = list(pos)
-                prime_start[2] = reference_z - prime_dist
-                self._toolhead.set_position(prime_start, homing_axes="z")
-                prime_target = list(prime_start)
-                prime_target[2] = reference_z
-                _klog(
-                    'priming first %s Z move after restart dist=%.3f speed=%.3f',
-                    'normal' if monitored else 'unmonitored',
-                    prime_dist, STARTUP_RISE_PRIME_SPEED)
-                prime_hmove = HomingMove(
-                    self.printer, endstops, self._toolhead)
-                prime_hmove.homing_move(
-                    prime_target, STARTUP_RISE_PRIME_SPEED,
-                    triggered=monitored, check_triggered=False)
             pos[2] = reference_z
             self._toolhead.set_position(pos, homing_axes="z")
             self._record_bottom_anchor()
@@ -806,8 +874,8 @@ class ZAlign:
             'prepared_zmax': self._prepared_zmax,
             'z_known': self._is_toolhead_z_homed(),
             'logical_z_applied': self._logical_z_applied,
-            'last_retry_delta_steps': self._last_retry_delta_steps,
-            'last_retry_delta_mm': self._last_retry_delta_mm,
+            'last_tilt_mm': self._last_tilt_mm,
+            'last_repeatability_mm': list(self._last_repeat_mm),
             'error': self._error or '',
         }
 
