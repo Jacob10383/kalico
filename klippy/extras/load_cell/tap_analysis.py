@@ -485,15 +485,27 @@ class TapAnalysis:
         self._pullback_duration = (
             self._pullback_end_time - self._pullback_start_time
         )
-        lines, i, j = self._force_graph.tap_decompose(
-            self._home_end_time,
-            self._pullback_start_time,
-            self._pullback_cruise_time,
-            self._pullback_duration,
-        )
-        self._homing_start_index = i
-        self._pullback_end_index = j
-        self.set_tap_lines(lines)
+        # too few samples in a segment means the tap can't be analyzed
+        try:
+            lines, i, j = self._force_graph.tap_decompose(
+                self._home_end_time,
+                self._pullback_start_time,
+                self._pullback_cruise_time,
+                self._pullback_duration,
+            )
+            self._homing_start_index = i
+            self._pullback_end_index = j
+            self.set_tap_lines(lines)
+        except (ValueError, ZeroDivisionError, IndexError) as e:
+            self._tap_lines = []
+            self._tap_points = []
+            self._tap_angles = []
+            self._tap_pos = None
+            raise TapValidationError(
+                "TAP_TOO_FEW_SAMPLES",
+                "Not enough samples to analyze the tap, try a longer or "
+                "slower pullback move: %s" % (e,),
+            )
         self._validate_order()
         self._validate_tap_shape()
         self._validate_break_contact_time()
