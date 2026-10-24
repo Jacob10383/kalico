@@ -31,3 +31,4 @@ src-$(CONFIG_WANT_SENSOR_ANGLE) += sensor_angle.c
 src-$(CONFIG_NEED_SENSOR_BULK) += sensor_bulk.c
 src-$(CONFIG_NEED_SOS_FILTER) += sos_filter.c
 src-$(CONFIG_NEED_LOAD_CELL_PROBE) += load_cell_probe.c
+src-$(CONFIG_WANT_K2_MCU) += k2_transparent.c k2_z_align.c

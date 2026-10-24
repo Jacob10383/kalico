@@ -302,6 +302,89 @@ command_set_next_step_dir(uint32_t *args)
 }
 DECL_COMMAND(command_set_next_step_dir, "set_next_step_dir oid=%c dir=%c");
 
+#if CONFIG_WANT_K2_MCU
+// Adopt a DIR pin level set outside the step engine (caller must disable
+// IRQs). The next queue_step then toggles from the real pin level.
+static void
+stepper_adopt_dir(struct stepper *s, uint8_t dir)
+{
+    if (!!(s->flags & SF_LAST_DIR) != !!dir)
+        s->position = -s->position;
+    s->flags &= ~(SF_LAST_DIR | SF_NEXT_DIR);
+    if (dir)
+        s->flags |= SF_LAST_DIR | SF_NEXT_DIR;
+}
+
+// z_align.c drives the Z DIR pins directly
+void
+stepper_sync_dir_pin(struct gpio_out dir, uint8_t val)
+{
+    uint8_t i;
+    struct stepper *s;
+    irqstatus_t flag = irq_save();
+    foreach_oid(i, s, command_config_stepper) {
+        if (s->dir_pin.regs == dir.regs && s->dir_pin.bit == dir.bit)
+            stepper_adopt_dir(s, val);
+    }
+    irq_restore(flag);
+}
+
+// The K2 motor boards read their RS485 address from their STEP/DIR inputs.
+// The host sends the address broadcast between action=0 and action=1.
+#define K2_MOTORS 4
+static struct {
+    struct stepper *steppers[K2_MOTORS];
+    uint8_t saved_step[K2_MOTORS], saved_dir[K2_MOTORS], active;
+} motor_address_latch;
+
+static void
+motor_address_latch_finish(void)
+{
+    if (!motor_address_latch.active)
+        return;
+    irqstatus_t flag = irq_save();
+    for (uint8_t i = 0; i < K2_MOTORS; i++) {
+        struct stepper *s = motor_address_latch.steppers[i];
+        uint8_t dir = motor_address_latch.saved_dir[i];
+        gpio_out_write(s->step_pin, motor_address_latch.saved_step[i]);
+        gpio_out_write(s->dir_pin, dir);
+        stepper_adopt_dir(s, dir);
+    }
+    motor_address_latch.active = 0;
+    irq_restore(flag);
+}
+
+void
+command_motor_address_latch(uint32_t *args)
+{
+    // A host restart may have interrupted a previous transaction
+    motor_address_latch_finish();
+    if (args[0])
+        return;
+    for (uint8_t i = 0; i < K2_MOTORS; i++) {
+        struct stepper *s = stepper_oid_lookup(args[i + 1]);
+        if (s->count || !move_queue_empty(&s->mq))
+            shutdown("motor address latch while stepper active");
+        motor_address_latch.steppers[i] = s;
+    }
+    // x/y/z/z1 boards take address 0x81 + DIR + 2*STEP: 0x82/0x81/0x83/0x84
+    static const uint8_t dir_values[K2_MOTORS] = { 1, 0, 0, 1 };
+    static const uint8_t step_values[K2_MOTORS] = { 0, 0, 1, 1 };
+    irqstatus_t flag = irq_save();
+    for (uint8_t i = 0; i < K2_MOTORS; i++) {
+        struct stepper *s = motor_address_latch.steppers[i];
+        motor_address_latch.saved_step[i] = gpio_out_read(s->step_pin);
+        motor_address_latch.saved_dir[i] = gpio_out_read(s->dir_pin);
+        gpio_out_write(s->dir_pin, dir_values[i]);
+        gpio_out_write(s->step_pin, step_values[i]);
+    }
+    motor_address_latch.active = 1;
+    irq_restore(flag);
+}
+DECL_COMMAND(command_motor_address_latch, "motor_address_latch action=%c"
+             " x_oid=%c y_oid=%c z_oid=%c z1_oid=%c");
+#endif
+
 // Set an absolute time that the next step will be relative to
 void
 command_reset_step_clock(uint32_t *args)

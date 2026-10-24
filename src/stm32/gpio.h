@@ -15,6 +15,7 @@ void gpio_out_reset(struct gpio_out g, uint32_t val);
 void gpio_out_toggle_noirq(struct gpio_out g);
 void gpio_out_toggle(struct gpio_out g);
 void gpio_out_write(struct gpio_out g, uint32_t val);
+uint8_t gpio_out_read(struct gpio_out g);
 
 struct gpio_in {
     void *regs;

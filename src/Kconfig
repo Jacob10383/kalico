@@ -228,6 +228,13 @@ config WANT_GPIO_I2C
     bool
     depends on HAVE_GPIO && HAVE_GPIO_I2C
     default y
+config WANT_K2_MCU
+    bool
+    depends on MACH_GD32F303
+    default y
+    help
+      Creality K2 support: motor UART forwarding, dual Z switch
+      alignment, and the motor board address straps.
 config NEED_SENSOR_BULK
     bool
     depends on WANT_ADXL345 || WANT_LIS2DW || WANT_MPU9250 || WANT_ICM20948 \
