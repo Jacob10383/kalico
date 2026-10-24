@@ -456,7 +456,7 @@ class TapAnalysis:
 
     # extract and save TrapQueue moves
     def _extract_trapq(self, printer):
-        trapq = printer.lookup_object("motion_report").trapqs["toolhead"]
+        trapq = printer.lookup_object("motion_report").dtrapqs["toolhead"]
         moves, _ = trapq.extract_trapq(float(self._time[0] + self._time_offset))
         for move in moves:
             self._moves.append(TrapezoidalMove(move, self._time_offset))
