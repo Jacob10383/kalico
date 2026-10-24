@@ -179,6 +179,10 @@ class PRTouch:
                 self._take_startup_tare,
                 self.reactor.monotonic() + _STARTUP_TARE_DELAY)
 
+    # Macros check "'prtouch' in printer", which needs a status object
+    def get_status(self, eventtime):
+        return {'probe': self.probe_name}
+
     def _take_startup_tare(self, eventtime):
         load_cell = getattr(self.printer.lookup_object(
             self.probe_name, None), '_load_cell', None)
