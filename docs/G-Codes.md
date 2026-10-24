@@ -1457,12 +1457,18 @@ The following commands are available when a
 #### TEST_PRESSURE_ADVANCE
 `TEST_PRESSURE_ADVANCE [METHOD=<method>] [EXTRUDER=<name>]
 [FORCE_SENSOR=<name>] [PA_RANGE=<min>,<max>] [SLOW_FLOW=<flow>]
-[HIGH_FLOW=<flow>] [PURGE_LENGTH=<length>] [SEGMENT_TIME=<time>]
-[TEST_REPETITIONS=<count>] [FILTER_WINDOW=<window>]
-[EXTRUDE_FORCE_SIGN=<sign>]`: Measure the optimal Pressure Advance
-using a load cell force sensor. The METHOD parameter selects the
-calibration method (default: `step_response`). The `search_overshoot`
-method additionally accepts `PA_RANGE` to constrain the search range.
+[HIGH_FLOW=<flow>] [FLOWS=<flow>,<flow>,...] [PURGE_LENGTH=<length>]
+[SEGMENT_TIME=<time>] [TEST_REPETITIONS=<count>]
+[FILTER_WINDOW=<window>] [EXTRUDE_FORCE_SIGN=<sign>]`: Measure the
+optimal Pressure Advance using a load cell force sensor. The METHOD
+parameter selects the calibration method (default: `step_response`).
+The `search_overshoot` method additionally accepts `PA_RANGE` to
+constrain the search range. The `step_response` method reports the
+Pressure Advance measured at each tested flow. `FLOWS` replaces
+`SLOW_FLOW` and `HIGH_FLOW` with a list of flow rates in mm^3/s, each
+measured `TEST_REPETITIONS` times; it is only supported by
+`step_response`. When more than one flow is measured, the results are
+also printed as an OrcaSlicer adaptive pressure advance model.
 The measured value is stored in the pa_tester status but is not applied.
 See configuration reference for descriptions of the configuration options
 that can be overridden via the parameters of this command.
@@ -1470,7 +1476,7 @@ that can be overridden via the parameters of this command.
 #### PA_CALIBRATE
 `PA_CALIBRATE [METHOD=<method>] [EXTRUDER=<name>] [FORCE_SENSOR=<name>]
 [PA_RANGE=<min>,<max>] [SLOW_FLOW=<flow>] [HIGH_FLOW=<flow>]
-[PURGE_LENGTH=<length>] [SEGMENT_TIME=<time>]
+[FLOWS=<flow>,<flow>,...] [PURGE_LENGTH=<length>] [SEGMENT_TIME=<time>]
 [TEST_REPETITIONS=<count>] [FILTER_WINDOW=<window>]
 [EXTRUDE_FORCE_SIGN=<sign>]`: Similarly to `TEST_PRESSURE_ADVANCE`,
 measures the optimal Pressure Advance using a load cell force sensor.

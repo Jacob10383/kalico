@@ -165,16 +165,56 @@ class PACalibrationExtruderTest:
     def get_fast_velocity(self, gcmd, filament_dia):
         return self._flow_to_velocity(self.high_flow.get(gcmd), filament_dia)
 
+    def get_flows(self, gcmd):
+        # FLOWS=<flow>,<flow>,... tests every listed flow; otherwise the
+        # test alternates between SLOW_FLOW and HIGH_FLOW
+        raw = gcmd.get('FLOWS', None)
+        if raw is None:
+            return None
+        try:
+            flows = sorted(set(float(v) for v in raw.split(',')))
+        except ValueError:
+            raise gcmd.error("FLOWS: invalid numeric value in '%s'" % raw)
+        if len(flows) < 2 or flows[0] <= 0.:
+            raise gcmd.error(
+                "FLOWS requires at least two distinct positive flow rates")
+        return flows
+
+    def _get_velocity_range(self, gcmd, filament_dia):
+        flows = self.get_flows(gcmd)
+        if flows is not None:
+            return (self._flow_to_velocity(flows[0], filament_dia),
+                    self._flow_to_velocity(flows[-1], filament_dia))
+        return (self.get_slow_velocity(gcmd, filament_dia),
+                self.get_fast_velocity(gcmd, filament_dia))
+
     def get_accel_limit(self, gcmd, filament_dia, smooth_time):
-        slow_velocity = self.get_slow_velocity(gcmd, filament_dia)
-        fast_velocity = self.get_fast_velocity(gcmd, filament_dia)
+        slow_velocity, fast_velocity = self._get_velocity_range(
+                gcmd, filament_dia)
         return (fast_velocity - slow_velocity) / (
                 ACCEL_DURATION_SMOOTH_TIME_MULT * smooth_time)
 
+    def _gen_flows_sequence(self, velocities, reps):
+        # Step into each flow from the farther end of the range so every
+        # step is at least half the range; extremes step into each other
+        lo, hi = velocities[0], velocities[-1]
+        mid = 0.5 * (lo + hi)
+        sequence = []
+        for _rep in range(reps):
+            for v in velocities:
+                if v == lo:
+                    sequence += [hi, lo]
+                elif v == hi:
+                    sequence += [lo, hi]
+                else:
+                    sequence += [hi if v < mid else lo, v]
+        return sequence
+
     def gen_test(self, gcmd, filament_dia, full_purge=True,
                  test_repetitions=None, gen_force_sig_test=False):
-        slow_velocity = self.get_slow_velocity(gcmd, filament_dia)
-        fast_velocity = self.get_fast_velocity(gcmd, filament_dia)
+        flows = self.get_flows(gcmd)
+        slow_velocity, fast_velocity = self._get_velocity_range(
+                gcmd, filament_dia)
         if fast_velocity <= slow_velocity:
             raise gcmd.error("high_flow must be greater than slow_flow")
         if fast_velocity < 2. * slow_velocity:
@@ -193,8 +233,19 @@ class PACalibrationExtruderTest:
             extruder_moves.append((self.purge_length.get(gcmd), fast_velocity))
         else:
             extruder_moves.append((fast_dist, fast_velocity))
-        extruder_moves += [(slow_dist, slow_velocity),
-                           (fast_dist, fast_velocity)] * reps
+        if flows is None:
+            extruder_moves += [(slow_dist, slow_velocity),
+                               (fast_dist, fast_velocity)] * reps
+        else:
+            velocities = [self._flow_to_velocity(f, filament_dia)
+                          for f in flows]
+            # Back-to-back moves at one speed would merge into a window
+            # with no flow change to fit, so skip repeats
+            prev_velocity = extruder_moves[-1][1]
+            for v in self._gen_flows_sequence(velocities, reps):
+                if v != prev_velocity:
+                    extruder_moves.append((v * seg_time, v))
+                    prev_velocity = v
         if gen_force_sig_test:
             medium_velocity = 0.5 * (slow_velocity + fast_velocity)
             medium_dist = medium_velocity * seg_time
@@ -323,6 +374,10 @@ def detect_force_sign(all_samples, all_moves):
     if diff < -FORCE_EPS:
         return -1
     return None
+
+
+def extruded_length(extruder_moves):
+    return sum(dist for dist, _velocity in extruder_moves)
 
 
 def velocity_key(v, places=4):
@@ -697,9 +752,10 @@ class StepResponseTest:
         return agg_taus, overall_tau
 
     def _respond(self, gcmd, velocity_taus, overall_tau, filament_diameter,
-                 segment_time, filter_window):
+                 segment_time, filter_window, extruded):
         area = math.pi * (filament_diameter / 2.) ** 2
-        lines = ["PA calibration results:"]
+        lines = ["PA calibration results (extruded %.0fmm of filament):"
+                 % (extruded,)]
         for v in sorted(velocity_taus.keys()):
             flow = v * area
             lines.append("  flow=%5.2f  pressure_advance=%.3f" % (
@@ -726,7 +782,20 @@ class StepResponseTest:
         else:
             lines.append("Failed to detect Pressure Advance value.")
             lines.append("Check sensor and filament and try again.")
+        if len(velocity_taus) < 2:
+            gcmd.respond_info("\n".join(lines))
+            return
+        # OrcaSlicer ignores the accel column when it has one value, but
+        # its validator wants accel > flow and no spaces
+        toolhead = self.printer.lookup_object('toolhead')
+        accel = toolhead.get_status(
+                self.printer.get_reactor().monotonic())['max_accel']
+        lines.append("OrcaSlicer adaptive pressure advance model:")
         gcmd.respond_info("\n".join(lines))
+        # Raw output, without the "// " prefix, so the rows paste as-is
+        gcmd.respond_raw("\n".join(
+            "%.4f,%.2f,%.0f" % (velocity_taus[v], v * area, accel)
+            for v in sorted(velocity_taus.keys())))
 
     def run(self, gcmd, extruder_test, data_collector, extruder_status,
             signal_filter, force_sign):
@@ -793,7 +862,8 @@ class StepResponseTest:
         logging.info("Phase 2 wall time: %.3f s", t2 - t1)
         p2_velocity_taus, p2_overall_tau = self._aggregate_taus(p2_fits)
         self._respond(gcmd, p2_velocity_taus, p2_overall_tau, filament_diameter,
-                      segment_time, signal_filter.filter_window)
+                      segment_time, signal_filter.filter_window,
+                      extruded_length(extruder_moves))
         if p2_velocity_taus:
             self.last_measured_pressure_advance = sorted(
                     [float(v) for v in p2_velocity_taus.values()])
@@ -975,6 +1045,7 @@ class SearchOvershootTest:
         old_pa_flag = extruder.set_enable_pa_for_extrude_only_moves(True)
         extruder_moves = extruder_test.gen_test(
                 gcmd, filament_diameter, full_purge=not self._extruder_purged)
+        self._extruded += extruded_length(extruder_moves)
         velocities = [v for _, v in extruder_moves]
         all_samples, all_moves = data_collector.collect(
             lambda: extruder_test.run_test(extruder_moves))
@@ -1204,8 +1275,9 @@ class SearchOvershootTest:
                 right = m
 
     def _respond(self, gcmd, optimal_pa, corrected_pa, pa_range):
-        lines = ["Search complete: %d tests, pressure_advance=%.4f" % (
-            self._test_count, optimal_pa)]
+        lines = ["Search complete: %d tests, pressure_advance=%.4f "
+                 "(extruded %.0fmm of filament)" % (
+                     self._test_count, optimal_pa, self._extruded)]
         if optimal_pa < PA_WARNING_LOW:
             lines.append(
                 "WARNING: tuned PA is very low (%.4f). This may indicate "
@@ -1262,6 +1334,7 @@ class SearchOvershootTest:
         extruder_moves = extruder_test.gen_test(
                 gcmd, filament_diameter, full_purge=True,
                 test_repetitions=0, gen_force_sig_test=True)
+        self._extruded += extruded_length(extruder_moves)
         all_samples, all_moves = data_collector.collect(
                 lambda: extruder_test.run_test(extruder_moves))
         force_sign = detect_force_sign(all_samples, all_moves)
@@ -1275,7 +1348,11 @@ class SearchOvershootTest:
             signal_filter, force_sign):
         self.last_measured_pressure_advance = None
         self.last_corrected_pressure_advance = None
+        if extruder_test.get_flows(gcmd) is not None:
+            raise gcmd.error(
+                "FLOWS is only supported by METHOD=step_response")
         self._extruder_purged = False
+        self._extruded = 0.
         self._test_count = 0
         filament_diameter = extruder_status['filament_diameter']
         area = math.pi * (filament_diameter / 2.) ** 2
