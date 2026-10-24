@@ -12,6 +12,18 @@ from statistics import median
 from types import SimpleNamespace
 
 _POST_HOME_LIFT = 3.0
+_STARTUP_TARE_DELAY = 1.0
+
+# Load cell probe values that hold for every K2, measured on one printer.
+# Every K2 has the same load cell, gain and toolhead, so a fresh install
+# can probe without LOAD_CELL_CALIBRATE. Values saved by SAVE_CONFIG win.
+# The unloaded zero differs per load cell, so without a saved
+# reference_tare_counts it is read at startup instead.
+_PROBE_DEFAULTS = (
+    ('z_offset', '0'),
+    ('counts_per_gram', '136.42751'),
+    ('decompression_angle', '88.3'),
+)
 
 # Options of the stock-firmware PRTouch detector, still accepted so older
 # configs load. The load cell probe now owns probing and its settings.
@@ -59,13 +71,18 @@ class PRTouch:
         # z_offset now belongs to the load cell probe
         self._legacy_z_offset = config.getfloat('z_offset', 0.)
         self.probe_name = config.get('probe', 'load_cell_probe')
-        # Default the probe's z_offset in memory rather than in the shipped
-        # include, so SAVE_CONFIG can store it without an include conflict.
+        # Default the probe's values in memory rather than in the shipped
+        # include, so SAVE_CONFIG can store them without an include conflict.
         # prtouch.cfg puts [prtouch] first so this runs before the probe.
         fileconfig = config.fileconfig
-        if (fileconfig.has_section(self.probe_name)
-                and not fileconfig.has_option(self.probe_name, 'z_offset')):
-            fileconfig.set(self.probe_name, 'z_offset', '0')
+        self._startup_tare = (
+            fileconfig.has_section(self.probe_name)
+            and not fileconfig.has_option(
+                self.probe_name, 'reference_tare_counts'))
+        if fileconfig.has_section(self.probe_name):
+            for option, value in _PROBE_DEFAULTS:
+                if not fileconfig.has_option(self.probe_name, option):
+                    fileconfig.set(self.probe_name, option, value)
         probe_config = config.getsection(self.probe_name)
         self.trigger_force = probe_config.getint(
             'trigger_force', 75, note_valid=False)
@@ -102,7 +119,7 @@ class PRTouch:
         self.scrub_detect_hold_ratio = config.getfloat(
             'scrub_detect_hold_ratio', 2.5, above=1.)
         self.scrub_detect_deflection = config.getfloat(
-            'scrub_detect_deflection', .035, above=0.)
+            'scrub_detect_deflection', .10, above=0.)
         self.scrub_tab_depth = config.getfloat(
             'scrub_tab_depth', .15, minval=0., maxval=.20)
         self.scrub_no_tab_depth = config.getfloat(
@@ -130,6 +147,9 @@ class PRTouch:
         self.gcode.register_command(
             'PRTOUCH_SCRUB', self.cmd_PRTOUCH_SCRUB,
             desc=self.cmd_PRTOUCH_SCRUB_help)
+        self.gcode.register_command(
+            'PRTOUCH_SCRUB_DETECT', self.cmd_PRTOUCH_SCRUB_DETECT,
+            desc=self.cmd_PRTOUCH_SCRUB_DETECT_help)
 
     def _handle_connect(self):
         probe_list = self.printer.lookup_object('probe_list', None)
@@ -154,6 +174,29 @@ class PRTouch:
             self.gcode.respond_raw(
                 "!! prtouch: [prtouch] z_offset is no longer used. Set "
                 "z_offset in [%s] instead." % (self.probe_name,))
+        if self._startup_tare and self._probe is not None:
+            self.reactor.register_callback(
+                self._take_startup_tare,
+                self.reactor.monotonic() + _STARTUP_TARE_DELAY)
+
+    def _take_startup_tare(self, eventtime):
+        load_cell = getattr(self.printer.lookup_object(
+            self.probe_name, None), '_load_cell', None)
+        # Skip if LOAD_CELL_CALIBRATE already set it
+        if (load_cell is None
+                or load_cell.get_reference_tare_counts() is not None):
+            return
+        try:
+            counts = load_cell.avg_counts()
+            load_cell.set_reference_tare_counts(counts)
+        except self.printer.command_error as error:
+            msg = ("prtouch: could not read the load cell zero at startup: "
+                   "%s. Run LOAD_CELL_CALIBRATE." % (error,))
+            logging.warning(msg)
+            self.gcode.respond_raw("!! " + msg)
+            return
+        logging.info("prtouch: load cell zero read at startup: %s",
+                     ", ".join("%d" % (c,) for c in counts))
 
     @property
     def position_endstop(self):
@@ -469,6 +512,64 @@ class PRTouch:
             self._zone_manual_move([None, None, lift_z], self.lift_speed)
             toolhead.wait_moves()
 
+    def _scrub_probe_gcmd(self):
+        # Tap analysis reports where contact began, which is the same for
+        # both forces on the tab. Scrub uses the trigger heights instead, as
+        # the stock detector reported and the scrub thresholds were tuned on.
+        return self._sample_gcmd(
+            'PRTOUCH_SCRUB_PROBE', {'DISABLE_PULLBACK_MOVE': '1'})
+
+    def _scrub_detect(self, toolhead, probe_gcmd, center):
+        high_force = min(250, int(round(
+            self.trigger_force * self.scrub_detect_hold_ratio)))
+        hard_gcmd = self._sample_gcmd(
+            'PRTOUCH_SCRUB_PROBE',
+            {'DISABLE_PULLBACK_MOVE': '1', 'TRIGGER_FORCE': str(high_force)})
+        self._scrub_lift(toolhead)
+        self._zone_manual_move(
+            [center[0], center[1], None], self.home_travel_speed)
+        toolhead.wait_moves()
+        deflections = []
+        normal_zs = []
+        for _sample in range(3):
+            normal_z = self._probe_one(probe_gcmd)[2]
+            normal_zs.append(normal_z)
+            self._retract_home_sample(probe_gcmd)
+            high_z = self._probe_one(hard_gcmd)[2]
+            self._retract_home_sample(probe_gcmd)
+            deflections.append(abs(normal_z - high_z))
+        deflection = round(float(median(deflections)), 6)
+        return deflection, deflections, normal_zs
+
+    def _scrub_line(self):
+        y = random.uniform(self.scrub_y_min, self.scrub_y_max)
+        start = (self.scrub_x_start, y)
+        end = (self.scrub_x_end, y)
+        center = [.5 * (start[0] + end[0]), .5 * (start[1] + end[1])]
+        return start, end, center
+
+    cmd_PRTOUCH_SCRUB_DETECT_help = (
+        "Run the scrub's tab detection only, without scrubbing.")
+
+    def cmd_PRTOUCH_SCRUB_DETECT(self, gcmd):
+        self._require_probe()
+        self.gcode.run_script_from_command("HOME_IF_NEEDED AXIS=XYZ")
+        toolhead = self.printer.lookup_object('toolhead')
+        _start, _end, center = self._scrub_line()
+        try:
+            deflection, deflections, _normal_zs = self._scrub_detect(
+                toolhead, self._scrub_probe_gcmd(), center)
+        finally:
+            self._scrub_lift(toolhead)
+        tab_detected = deflection > self.scrub_detect_deflection
+        gcmd.respond_info(
+            "prtouch: %s at %.1f,%.1f: deflection median %.4fmm %s %.4fmm "
+            "(%s)"
+            % ("tab detected" if tab_detected else "no tab",
+               center[0], center[1], deflection,
+               ">" if tab_detected else "<=", self.scrub_detect_deflection,
+               ", ".join("%.4f" % (d,) for d in deflections)))
+
     cmd_PRTOUCH_SCRUB_help = (
         "Detect the flexible rear bed tab and scrub the nozzle against it.")
 
@@ -476,38 +577,11 @@ class PRTouch:
         self._require_probe()
         self.gcode.run_script_from_command("HOME_IF_NEEDED AXIS=XYZ")
         toolhead = self.printer.lookup_object('toolhead')
-        # Tap analysis reports where contact began, which is the same for
-        # both forces on the tab. Scrub uses the trigger heights instead, as
-        # the stock detector reported and the scrub thresholds were tuned on.
-        raw = {'DISABLE_PULLBACK_MOVE': '1'}
-        probe_gcmd = self._sample_gcmd('PRTOUCH_SCRUB_PROBE', raw)
-        high_force = min(250, int(round(
-            self.trigger_force * self.scrub_detect_hold_ratio)))
-        hard_gcmd = self._sample_gcmd(
-            'PRTOUCH_SCRUB_PROBE', dict(raw, TRIGGER_FORCE=str(high_force)))
+        probe_gcmd = self._scrub_probe_gcmd()
         try:
-            y = random.uniform(self.scrub_y_min, self.scrub_y_max)
-            start = (self.scrub_x_start, y)
-            end = (self.scrub_x_end, y)
-            self._scrub_lift(toolhead)
-
-            center = [
-                .5 * (start[0] + end[0]),
-                .5 * (start[1] + end[1]),
-            ]
-            self._zone_manual_move(
-                [center[0], center[1], None], self.home_travel_speed)
-            toolhead.wait_moves()
-            deflections = []
-            normal_zs = []
-            for _sample in range(3):
-                normal_z = self._probe_one(probe_gcmd)[2]
-                normal_zs.append(normal_z)
-                self._retract_home_sample(probe_gcmd)
-                high_z = self._probe_one(hard_gcmd)[2]
-                self._retract_home_sample(probe_gcmd)
-                deflections.append(abs(normal_z - high_z))
-            deflection = round(float(median(deflections)), 6)
+            start, end, center = self._scrub_line()
+            deflection, _deflections, normal_zs = self._scrub_detect(
+                toolhead, probe_gcmd, center)
             tab_detected = deflection > self.scrub_detect_deflection
             depth = (
                 self.scrub_tab_depth if tab_detected
