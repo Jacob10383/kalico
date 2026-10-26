@@ -1156,6 +1156,16 @@ control:
 #   not recommended to set this unless there is an electrical
 #   requirement to switch the heater faster than 10 times a second.
 #   The default is 0.100 seconds.
+#hardware_pwm: False
+#   Enable this to use hardware PWM instead of software PWM for the heater.
+#   Generally speaking, the 10Hz is duty cycle acceptable for most scenarios,
+#   but there are cases where a higher frequency is desired. For example,
+#   a low PWM frequency can interfere with the load_cell_probe sensor
+#   readings when the load cell is close to the heater. In the case that
+#   a higher PWM frequency is required, it is recommended to use hardware PWM.
+#   When using hardware PWM the actual cycle time is constrained by the
+#   implementation and may be significantly different than the requested
+#   cycle_time. The default is False.
 #lost_update_tolerance: 2
 #   Maximum number of consecutive sensor lost samples that can be
 #   recovered from.
@@ -2459,6 +2469,36 @@ main printer config file. Wildcards may also be used (eg,
 [include my_other_config.cfg]
 ```
 
+Variables may be passed to an include by listing them below the include
+line. The included file is then rendered as a Jinja2 template, using
+`{! !}` for expressions and `{!% %!}` for statements (so they don't clash
+with the `{ }` / `{% %}` templates used by gcode macros). The variables
+are also available to any file it includes. A file included without
+variables is read as-is. Referencing a variable that was not passed is
+an error.
+
+```
+[include toolhead_board.cfg]
+mcu_name: toolhead0
+mcu_serial: /dev/serial/by-id/usb-Klipper_rp2040_toolhead0
+
+[include toolhead_board.cfg]
+mcu_name: toolhead1
+mcu_serial: /dev/serial/by-id/usb-Klipper_rp2040_toolhead1
+```
+
+Where `toolhead_board.cfg` contains:
+
+```
+[mcu {! mcu_name !}]
+serial: {! mcu_serial !}
+
+{!% if mcu_name == "toolhead0" %!}
+[fan_generic {! mcu_name !}_fan]
+pin: {! mcu_name !}:gpio13
+{!% endif %!}
+```
+
 ### [duplicate_pin_override]
 
 This tool allows a single micro-controller pin to be defined multiple
@@ -3392,6 +3432,7 @@ target temperature.
 #pid_Ki:
 #pid_Kd:
 #pwm_cycle_time:
+#hardware_pwm:
 #lost_update_tolerance:
 #min_temp:
 #max_temp:
@@ -4563,6 +4604,9 @@ sense_resistor:
 #   "sensorless homing". (Be sure to also set driver_SGT to an
 #   appropriate sensitivity value.) The default is to not enable
 #   sensorless homing.
+#   If no diag pin is specified, the virtual_endstop is still available
+#   and the micro-controller polls the stallguard flag over SPI instead.
+#   See the TMC_Drivers.md document for details.
 ```
 
 ### [tmc2208]
@@ -4945,6 +4989,9 @@ run_current:
 #   "sensorless homing". (Be sure to also set driver_SGT OR driver_SG4_THRS
 #   to an appropriate sensitivity value.) The default is to not enable
 #   sensorless homing.
+#   If no diag pin is specified, the virtual_endstop is still available
+#   and the micro-controller polls the stallguard flag over SPI instead.
+#   See the TMC_Drivers.md document for details.
 ```
 
 ### [tmc5160]
@@ -5099,7 +5146,92 @@ sense_resistor:
 #   "sensorless homing". (Be sure to also set driver_SGT to an
 #   appropriate sensitivity value.) The default is to not enable
 #   sensorless homing.
+#   If no diag pin is specified, the virtual_endstop is still available
+#   and the micro-controller polls the stallguard flag over SPI instead.
+#   See the TMC_Drivers.md document for details.
 ```
+
+### [tmc5262]
+
+Configure a TMC5262 stepper motor driver via SPI. Define a section with a
+"tmc5262" prefix followed by the name of the corresponding stepper
+(for example, "[tmc5262 stepper_x]").
+
+This implementation supports SpreadCycle with a physical endstop.
+
+```
+[tmc5262 stepper_x]
+cs_pin:
+#   The pin connected to the driver's chip select input. This parameter
+#   must be provided.
+#spi_speed:
+#spi_bus:
+#spi_software_sclk_pin:
+#spi_software_mosi_pin:
+#spi_software_miso_pin:
+#   See the "common SPI settings" section.
+#chain_position:
+#chain_length:
+#   See the tmc5160 section for SPI daisy chain settings.
+#interpolate: True
+#   Enable interpolation to 256 microsteps. The default is True.
+run_current:
+#   Motor current in amps RMS. This parameter must be provided.
+#   Klipper selects the smallest hardware current range that fits this
+#   value. SET_TMC_CURRENT is limited to that range; configure a higher
+#   run_current and restart to select a larger range if needed.
+#hold_current:
+#   Current in amps RMS when the motor is not moving. The default is
+#   run_current. Setting a separate hold_current is not recommended;
+#   see TMC_Drivers.md.
+#home_current:
+#   The amount of current (in amps RMS) to configure the driver to use
+#   during homing procedures. The default is to not reduce the current.
+#current_change_dwell_time:
+#   The amount of time (in seconds) to wait after changing homing current.
+#   The default is 0.5 seconds.
+#rref: 12000
+#   Resistance in ohms of the reference resistor between REF and GND.
+#   Obtain this value from the driver board documentation or schematic.
+#   The default is 12000. The driver uses integrated current sensing,
+#   not an external sense resistor.
+#driver_MSLUT0: 2863314260
+#driver_MSLUT1: 1251300522
+#driver_MSLUT2: 608774441
+#driver_MSLUT3: 269500962
+#driver_MSLUT4: 4227858431
+#driver_MSLUT5: 3048961917
+#driver_MSLUT6: 1227445590
+#driver_MSLUT7: 4211234
+#driver_W0: 2
+#driver_W1: 1
+#driver_W2: 1
+#driver_W3: 1
+#driver_X1: 128
+#driver_X2: 255
+#driver_X3: 255
+#driver_START_SIN: 0
+#driver_START_SIN90: 247
+#driver_OFFSET_SIN90: 0
+#   See the tmc2240 section for Microstep Table settings.
+#driver_MULTISTEP_FILT: True
+#driver_IHOLDDELAY: 7
+#driver_IRUNDELAY: 4
+#driver_TPOWERDOWN: 10
+#driver_TBL: 2
+#driver_TOFF: 3
+#driver_HEND: 2
+#driver_HSTRT: 5
+#driver_FD3: 0
+#driver_DISFDCC: 0
+#driver_TPFD: 4
+#driver_CHM: 0
+#driver_SLOPE_CONTROL: 3
+#   Set the corresponding register field during driver configuration.
+#   See the TMC5262 datasheet for field definitions. The defaults are
+#   shown above.
+```
+
 
 ## Run-time stepper motor current configuration
 

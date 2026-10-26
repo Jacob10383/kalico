@@ -170,6 +170,14 @@ The following information is available in the
 - `excluded_objects`: An array of strings listing the names of excluded objects.
 - `current_object`: The name of the object currently being printed.
 
+## extruder
+
+The following information is available for
+[extruder](Config_Reference.md#extruder) objects, in addition to the
+[heater](#heater) and [extruder_stepper](#extruder_stepper) fields:
+- `nozzle_diameter`: The current nozzle diameter, as set in the config or
+  by [SET_NOZZLE_DIAMETER](G-Codes.md#set_nozzle_diameter).
+
 ## extruder_stepper
 
 The following information is available for extruder_stepper objects (as well as
