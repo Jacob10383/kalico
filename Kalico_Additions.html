@@ -2060,6 +2060,34 @@
   
   
     <li class="md-nav__item">
+      <a href="Developer_Cookbook.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Developer Cookbook
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="Kinematics.html" class="md-nav__link">
         
   
@@ -2932,9 +2960,11 @@
 <li><a href="Config_Reference.html#virtual_sdcard"><code>[virtual_sdcard] with_subdirs</code></a> enables scanning of subdirectories for .gcode files, for the menu and M20/M23 commands</li>
 <li><a href="Config_Reference.html#firmware_retraction"><code>[firmware_retraction] z_hop_height</code></a> adds an automatic z hop when using firmware retraction</li>
 <li><a href="Config_Reference.html#configuration-references"><code>[constants]</code> and <code>${constants.value}</code></a> allow re-using values in your configuration</li>
+<li><a href="Config_Reference.html#include"><code>[include]</code> variables</a> let one included file be reused with different values, e.g. one board config for several toolhead MCUs</li>
 </ul>
 <h2 id="enhanced-behavior">Enhanced behavior<a class="headerlink" href="#enhanced-behavior" title="Permanent link">&para;</a></h2>
 <ul>
+<li><a href="G-Codes.html#set_nozzle_diameter"><code>SET_NOZZLE_DIAMETER</code></a> changes an extruder's nozzle diameter (and optionally its max extrusion cross section) at runtime, e.g. for toolheads with different nozzles or a high-flow purge line.</li>
 <li><a href="CANBUS.html#finding-the-canbus_uuid-for-new-micro-controllers"><code>canbus_query.py</code></a> now responds with all Kalico devices, even after they've been assigned a node_id.</li>
 <li>Input shaper calibration now warns about active fans that may affect measurement accuracy.</li>
 <li><a href="G-Codes.html#bed_mesh_check"><code>BED_MESH_CHECK</code></a> validates the current bed mesh against specified criteria, allowing you to check maximum deviation and slope between adjacent points before printing.</li>
@@ -2983,6 +3013,7 @@
 <h2 id="tmc-drivers">TMC Drivers<a class="headerlink" href="#tmc-drivers" title="Permanent link">&para;</a></h2>
 <ul>
 <li><a href="Config_Reference.html#tmc2240"><code>[tmc2240] driver_CS and current_range</code></a> let you tune the current scaler and current range of your tmc2240 drivers.</li>
+<li><a href="TMC_Drivers.html#sensorless-homing-via-spi">Sensorless homing via SPI</a> polls the stallguard flag of SPI drivers, so no DIAG pin is needed.</li>
 </ul>
 <h2 id="macros">Macros<a class="headerlink" href="#macros" title="Permanent link">&para;</a></h2>
 <ul>
