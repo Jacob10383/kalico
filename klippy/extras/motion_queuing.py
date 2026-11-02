@@ -266,8 +266,10 @@ class PrinterMotionQueuing:
             flush_count = 0
             while self.last_step_gen_time < faux_time:
                 target = self.last_step_gen_time + batch_time
-                if flush_count > 100.0:
-                    target = faux_time
+                if flush_count > 100.0 and faux_time > target:
+                    target += (
+                        int((faux_time - target) / batch_time) * batch_time
+                    )
                 self._advance_flush_time(0.0, target)
                 flush_count += 1
             if flush_count:
@@ -298,7 +300,7 @@ class PrinterMotionQueuing:
         # Disable background flushing from timer
         self.reactor.update_timer(self.flush_timer, self.reactor.NEVER)
         self.do_kick_flush_timer = False
-        self._advance_flush_time(start_time)
+        self._advance_flush_time(start_time - SDS_CHECK_TIME, start_time)
         # Flush in segments until drip_completion signal
         flush_time = start_time
         while flush_time < end_time:
@@ -313,7 +315,7 @@ class PrinterMotionQueuing:
                 continue
             flush_time = min(flush_time + DRIP_SEGMENT_TIME, end_time)
             self.note_mcu_movequeue_activity(flush_time)
-            self._advance_flush_time(flush_time)
+            self._advance_flush_time(flush_time - SDS_CHECK_TIME, flush_time)
         # Restore background flushing
         self.reactor.update_timer(self.flush_timer, self.reactor.NOW)
         self._advance_flush_time(flush_time + self.kin_flush_delay)
